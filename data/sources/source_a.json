@@ -1,0 +1,33 @@
+{
+  "source": "vendor_a",
+  "batch_id": "batch-a-001",
+  "entries": [
+    {
+      "type": "ipv4",
+      "indicator": "185.220.101.42",
+      "confidence": 55,
+      "first_seen": "2026-09-10T08:00:00Z",
+      "last_seen": "2026-09-15T08:00:00Z",
+      "valid_until": "2026-10-15T00:00:00Z",
+      "tags": ["botnet", "c2"]
+    },
+    {
+      "type": "domain",
+      "indicator": "evil.example.com",
+      "confidence": "medium",
+      "first_seen": "2026-09-12T00:00:00Z",
+      "last_seen": "2026-09-20T00:00:00Z",
+      "valid_until": "2026-10-20T00:00:00Z",
+      "labels": "phishing,loader"
+    },
+    {
+      "type": "sha256",
+      "indicator": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "confidence": "high",
+      "first_seen": "2026-09-01T00:00:00Z",
+      "last_seen": "2026-09-05T00:00:00Z",
+      "valid_until": "2026-09-10T00:00:00Z",
+      "tags": ["malware"]
+    }
+  ]
+}

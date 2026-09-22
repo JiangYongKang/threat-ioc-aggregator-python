@@ -1,0 +1,15 @@
+{
+  "source": "vendor_a",
+  "batch_id": "batch-a-001",
+  "entries": [
+    {
+      "type": "ipv4",
+      "indicator": "185.220.101.42",
+      "confidence": 55,
+      "first_seen": "2026-09-10T08:00:00Z",
+      "last_seen": "2026-09-15T08:00:00Z",
+      "valid_until": "2026-10-15T00:00:00Z",
+      "tags": ["botnet", "c2"]
+    }
+  ]
+}

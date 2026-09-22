@@ -1,0 +1,38 @@
+{
+  "source": "vendor_b",
+  "batch_id": "batch-b-001",
+  "entries": [
+    {
+      "kind": "ip",
+      "data": "185.220.101.42",
+      "severity": 90,
+      "observed_at": "2026-09-21 10:00:00",
+      "expires_at": "2026-11-01 00:00:00",
+      "threat_types": ["c2", "tor_exit"],
+      "internal_score": 42
+    },
+    {
+      "kind": "domain",
+      "data": "WWW.Malware-Drop.test",
+      "feed_priority": "P1"
+    },
+    {
+      "kind": "url",
+      "data": "http://bad.example.test/path",
+      "severity": "low",
+      "observed_at": "2026-09-18T00:00:00Z",
+      "expires_at": "2026-09-19T00:00:00Z"
+    },
+    {
+      "kind": "ip",
+      "data": "999.1.2.3",
+      "severity": "high",
+      "observed_at": "2026-09-19T00:00:00Z"
+    },
+    {
+      "kind": "ipv4",
+      "severity": "high",
+      "observed_at": "2026-09-19T00:00:00Z"
+    }
+  ]
+}
