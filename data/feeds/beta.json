@@ -1,0 +1,29 @@
+{
+  "source": "beta",
+  "batch_id": "beta-2026-09-21-01",
+  "entries": [
+    {
+      "dst_ip": "203.0.113.10",
+      "threat_level": "c2",
+      "weight": 0.6,
+      "malware_family": "Sliver",
+      "published_at": "2026-09-19T10:00:00Z",
+      "seen_last": "2026-09-21T10:00:00Z"
+    },
+    {
+      "dst_ip": "198.51.100.23",
+      "threat_level": "suspicious",
+      "weight": 0.55,
+      "malware_family": ["drift"],
+      "published_at": "2026-09-20T10:00:00Z",
+      "ttl_days": 5
+    },
+    "broken-entry-not-an-object",
+    {
+      "dst_ip": "8.8.8.8",
+      "threat_level": "clean",
+      "weight": 0.4,
+      "published_at": "2026-09-20T10:00:00Z"
+    }
+  ]
+}

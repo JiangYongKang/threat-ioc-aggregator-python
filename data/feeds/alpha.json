@@ -1,0 +1,46 @@
+{
+  "source": "alpha",
+  "batch_id": "alpha-2026-09-20-01",
+  "entries": [
+    {
+      "indicator": "203.0.113.10",
+      "type": "ip",
+      "source": "alpha",
+      "confidence": 0.85,
+      "verdict": "malicious",
+      "tags": ["botnet", "c2"],
+      "first_seen": "2026-09-18T08:00:00Z",
+      "last_seen": "2026-09-20T08:00:00Z",
+      "validity_days": 30
+    },
+    {
+      "indicator": "evil.example.com",
+      "type": "domain",
+      "source": "alpha",
+      "confidence": 0.7,
+      "verdict": "phishing",
+      "tags": ["phish"],
+      "first_seen": "2026-09-19T00:00:00Z",
+      "expires_at": "2026-09-22T00:00:00Z"
+    },
+    {
+      "ioc": "44.55.66.77",
+      "source": "alpha",
+      "confidence": 0.9,
+      "verdict": "malicious",
+      "first_seen": "2026-09-21T00:00:00Z"
+    },
+    {
+      "indicator": "   ",
+      "source": "alpha",
+      "verdict": "malicious"
+    },
+    {
+      "indicator": "9.9.9.9",
+      "type": "ip",
+      "source": "alpha",
+      "confidence": "not-a-number",
+      "verdict": "malicious"
+    }
+  ]
+}
