@@ -56,6 +56,18 @@ class IngestionService:
         ).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()
 
+    # ------------------------------------------------- 全量重算
+
+    def recompute_all(self, revision: object) -> dict[str, int]:
+        """在与批次写入同一把全局锁内执行全量重新判定。
+
+        重算与并发投递的批次严格串行：重算期间到达的批次在锁外等待，
+        不会丢失、不会与重算交叉产生新旧权重混用的中间态。
+        """
+
+        with self._global_lock:
+            return self.store.recompute_all(revision)
+
     # ------------------------------------------------- 主入口
 
     def submit_batch(

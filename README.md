@@ -7,7 +7,8 @@
 - **多来源字段不一致、条目残缺**；
 - **多来源重复 / 先后投递**；
 - **过期与撤回**；
-- **并发提交与批次重放**
+- **并发提交与批次重放**；
+- **来源可信度权重可配、权重变更后全量动态重算**
 
 等场景下，结论仍然**一致、可追溯、幂等**。
 
@@ -17,7 +18,7 @@
 # 1. 安装依赖（需要 Python >= 3.14，使用 uv）
 uv sync --group dev
 
-# 2. 运行全部测试（61 个，含并发/过期边界/重放）
+# 2. 运行全部测试（72 个，含并发/过期边界/重放/权重重算）
 uv run pytest
 
 # 3. 启动 HTTP 服务（启动时自动加载 data/feeds/*.json）
@@ -32,8 +33,25 @@ uv run uvicorn main:app --reload
 | POST | `/api/v1/batches` | 提交情报批次（并发安全、幂等、原子写入） |
 | GET  | `/api/v1/iocs` | 列出当前**可见**指标（过期/撤回不出现），支持 `?ioc_type=ip` |
 | GET  | `/api/v1/iocs/{indicator}` | 查询指标完整聚合记录与审计历史（含过期/撤回，用于追溯） |
-| GET  | `/api/v1/iocs/{indicator}/explain` | 返回置信度与判定结论的**人类可读依据** |
+| GET  | `/api/v1/iocs/{indicator}/explain` | 返回置信度与判定结论的**人类可读依据**（含各来源权重与贡献） |
+| GET  | `/api/v1/weights` | 查看当前来源权重版本与全部变更历史 |
+| PUT  | `/api/v1/weights` | 整表替换来源权重并**原子触发全量重新判定**（幂等） |
 | GET  | `/api/v1/feeds/report` | 启动时本地情报文件的加载/入库汇总（含文件级错误） |
+
+### 来源权重示例
+
+```bash
+# 调权：alpha 权重 2.0，其余来源默认 1.0；全量存量指标按新权重原子重算
+curl -X PUT http://127.0.0.1:8000/api/v1/weights \
+  -H 'content-type: application/json' \
+  -d '{"weights": {"alpha": 2.0}, "note": "alpha 近期误报少，调升"}'
+
+# 查看权重版本与变更历史（什么时候被改成了什么）
+curl http://127.0.0.1:8000/api/v1/weights
+
+# 查看某指标各来源的权重与对最终结论的贡献
+curl http://127.0.0.1:8000/api/v1/iocs/203.0.113.10/explain
+```
 
 ### 提交批次示例
 
@@ -86,6 +104,7 @@ uv run pytest tests/test_ingestion.py       # 原子性 / 幂等 / 并发
 uv run pytest tests/test_lifecycle.py       # 过期边界 / 撤回 / 置信度
 uv run pytest tests/test_service_feeds.py   # 多来源文件端到端
 uv run pytest tests/test_api.py             # HTTP 行为与错误码
+uv run pytest tests/test_weights.py         # 权重生效 / 全量重算 / 并发交叉 / 失败重试
 ```
 
 目录结构与详细规则见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。

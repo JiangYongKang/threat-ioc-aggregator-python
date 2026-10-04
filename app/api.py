@@ -17,6 +17,7 @@ from app.ingestion import BatchRejected
 from app.logging_utils import get_logger
 from app.models import BatchRejectReason
 from app.service import ThreatIocService
+from app.weights import WeightConfigError
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,13 @@ class BatchSubmitRequest(BaseModel):
     batch_id: str | None = Field(default=None, description="批次幂等键")
     source_hint: str | None = Field(default=None, description="来源兜底标识")
     entries: Any = Field(default=None, description="条目列表，元素为任意 JSON")
+
+
+class WeightUpdateRequest(BaseModel):
+    """权重变更请求体：整表替换 {来源: 权重}，触发全量重新判定。"""
+
+    weights: Any = Field(default=None, description="{来源名: 正数权重}")
+    note: str = Field(default="", description="本次变更备注（写入历史）")
 
 
 def _ioc_to_dict(ioc) -> dict[str, Any]:
@@ -61,6 +69,7 @@ def _ioc_to_dict(ioc) -> dict[str, Any]:
         "expires_at": ioc.expires_at,
         "revoked": ioc.revoked,
         "updated_at": ioc.updated_at,
+        "weights_version": ioc.weights_version,
         "history": [
             {"at": h.at, "batch_id": h.batch_id, "source": h.source,
              "action": h.action, "detail": h.detail}
@@ -160,6 +169,33 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
         items = app.state.service.list_active(ioc_type=type_filter)
         return {"count": len(items), "items": [_ioc_to_dict(i) for i in items]}
 
+    @app.get("/api/v1/weights")
+    def get_weights() -> dict[str, Any]:
+        """查看当前权重版本与全部变更历史。"""
+
+        return app.state.service.get_weights()
+
+    @app.put("/api/v1/weights")
+    def update_weights(req: WeightUpdateRequest) -> dict[str, Any]:
+        """整表替换来源权重并触发全量重新判定（原子、幂等）。"""
+
+        try:
+            result = app.state.service.update_weights(
+                req.weights, note=req.note)
+        except WeightConfigError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_weight_config", "message": exc.detail},
+            ) from exc
+        return {
+            "version": result.version,
+            "changed": result.changed,
+            "recomputed": result.recomputed,
+            "affected": result.affected,
+            "weights": result.weights,
+            "note": result.note,
+        }
+
     @app.get("/api/v1/iocs/{indicator:path}/explain")
     def explain_ioc(indicator: str) -> dict[str, Any]:
         """返回指标置信度与判定结论的人类可读依据。"""
@@ -176,6 +212,14 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
             "confidence_basis": explanation.confidence_basis,
             "verdict_basis": explanation.verdict_basis,
             "sources": list(explanation.sources),
+            "weights_version": explanation.weights_version,
+            "contributions": [
+                {"source": c.source, "weight": c.weight,
+                 "raw_confidence": c.raw_confidence,
+                 "effective_confidence": c.effective_confidence,
+                 "verdict": c.verdict, "live": c.live}
+                for c in explanation.contributions
+            ],
         }
 
 

@@ -11,10 +11,16 @@ from dataclasses import dataclass
 
 from app.feeds import LoadedFeed, load_all_feeds
 from app.ingestion import BatchRejected, IngestionService
-from app.lifecycle import explain_confidence, explain_verdict, now_iso
+from app.lifecycle import (
+    explain_confidence,
+    explain_contributions,
+    explain_verdict,
+    now_iso,
+)
 from app.logging_utils import get_logger
-from app.models import BatchResult, IocStatus, IocType
+from app.models import BatchResult, IocStatus, IocType, SourceContribution
 from app.store import IocStore
+from app.weights import WeightRevision, WeightStore
 
 logger = get_logger(__name__)
 
@@ -42,6 +48,20 @@ class Explanation:
     verdict_basis: str
     sources: tuple[str, ...]
     visible: bool
+    weights_version: int = 0
+    contributions: tuple[SourceContribution, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WeightUpdateResult:
+    """一次权重变更（含全量重算）的结果。"""
+
+    version: int
+    changed: bool            # 权重内容是否真的发生了变化
+    recomputed: int          # 参与重算的指标数
+    affected: int            # 结论发生变化的指标数
+    weights: dict[str, float]
+    note: str
 
 
 class ThreatIocService:
@@ -50,7 +70,8 @@ class ThreatIocService:
     def __init__(self, feeds_dir: str | None = None,
                  max_entries_per_batch: int = 10_000) -> None:
         self.feeds_dir = feeds_dir
-        self.store = IocStore()
+        self.weight_store = WeightStore()
+        self.store = IocStore(weight_store=self.weight_store)
         self.ingestion = IngestionService(
             self.store, max_entries_per_batch=max_entries_per_batch
         )
@@ -69,6 +90,51 @@ class ThreatIocService:
         return self.ingestion.submit_batch(
             batch_id, entries, source_hint=source_hint
         )
+
+    # ------------------------------------------------- 权重管理
+
+    def update_weights(self, weights: object, *, note: str = "") -> WeightUpdateResult:
+        """校验并生效一版新权重，随后对全量存量指标原子重算。
+
+        - 配置非法：抛 WeightConfigError，存储与权重版本零变更；
+        - 与当前版本内容相同：直接返回当前版本（幂等，不重算、不升版本）；
+        - 重算与批次写入互斥，整体生效或整体不生效；失败可安全重试。
+        """
+
+        validated = self.weight_store.validate(weights)
+        current = self.weight_store.current()
+        if validated == current.weights:
+            logger.info("[权重变更] 与当前版本 v%d 内容一致，幂等返回",
+                        current.version)
+            return WeightUpdateResult(
+                version=current.version, changed=False,
+                recomputed=0, affected=0,
+                weights=dict(current.weights), note=note,
+            )
+
+        revision = self.weight_store.next_revision(validated, note)
+        logger.info("[权重变更] 提交新版本 v%d weights=%s note=%s，开始全量重算",
+                    revision.version, revision.weights, note)
+        summary = self.ingestion.recompute_all(revision)
+        return WeightUpdateResult(
+            version=revision.version, changed=True,
+            recomputed=summary["total"], affected=summary["changed"],
+            weights=dict(revision.weights), note=note,
+        )
+
+    def get_weights(self) -> dict:
+        """当前权重版本与全部变更历史（什么时候被改成了什么）。"""
+
+        current = self.weight_store.current()
+        return {
+            "version": current.version,
+            "weights": dict(current.weights),
+            "history": [
+                {"version": r.version, "at": r.at,
+                 "weights": dict(r.weights), "note": r.note}
+                for r in self.weight_store.history()
+            ],
+        }
 
     # ------------------------------------------------- 本地情报
 
@@ -140,14 +206,15 @@ class ThreatIocService:
         return self.store.get(indicator, now=now)
 
     def explain(self, indicator: str, *, now: str | None = None):
-        """返回指标结论的可解释视图（含置信度与判定依据）。"""
+        """返回指标结论的可解释视图（含置信度、判定依据与各来源贡献）。"""
 
         now = now or now_iso()
         ioc = self.store.get(indicator, now=now)
         if ioc is None:
             return None
-        confidence, conf_basis = explain_confidence(ioc.sources, now)
-        verdict, verdict_basis = explain_verdict(ioc.sources, now)
+        weights = self.weight_store.weights_view()
+        confidence, conf_basis = explain_confidence(ioc.sources, now, weights)
+        verdict, verdict_basis = explain_verdict(ioc.sources, now, weights)
         return Explanation(
             indicator=ioc.indicator,
             status=ioc.status.value,
@@ -157,6 +224,9 @@ class ThreatIocService:
             verdict_basis=verdict_basis,
             sources=tuple(sorted(ioc.sources)),
             visible=ioc.status is IocStatus.ACTIVE,
+            weights_version=ioc.weights_version,
+            contributions=tuple(
+                explain_contributions(ioc.sources, now, weights)),
         )
 
     def list_active(self, *, ioc_type: IocType | None = None,

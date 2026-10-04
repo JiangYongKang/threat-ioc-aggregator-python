@@ -89,6 +89,18 @@ class SourceObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceContribution:
+    """单个来源对最终结论的贡献（查询时可解释：各来源出了多少力）。"""
+
+    source: str
+    weight: float
+    raw_confidence: float
+    effective_confidence: float
+    verdict: str
+    live: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AuditEvent:
     """指标上的一次可追溯变更。"""
 
@@ -115,6 +127,7 @@ class Ioc:
     expires_at: str | None = None
     revoked: bool = False
     updated_at: str = ""
+    weights_version: int = 0
     history: list[AuditEvent] = field(default_factory=list)
 
 
