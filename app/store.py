@@ -29,6 +29,7 @@ from app.models import (
     IocType,
     SourceObservation,
 )
+from app.weights import WeightRegistry
 
 logger = get_logger(__name__)
 
@@ -36,10 +37,11 @@ logger = get_logger(__name__)
 class IocStore:
     """线程安全的 IOC 聚合存储。"""
 
-    def __init__(self) -> None:
+    def __init__(self, weights: WeightRegistry | None = None) -> None:
         self._iocs: dict[str, Ioc] = {}
         # batch_id -> (批次指纹, 首次处理结果)，用于幂等重放与冲突检测
         self._batches: dict[str, tuple[str, BatchResult]] = {}
+        self._weights = weights or WeightRegistry()
         self._lock = threading.RLock()
 
     # ------------------------------------------------------- 写入
@@ -144,15 +146,19 @@ class IocStore:
             logger.info("指标 %s 状态迁移: %s -> %s @ %s",
                         indicator, old_status.value, ioc.status.value, now)
 
-    def _apply_recompute(self, target: Ioc, now: str) -> IocStatus:
+    def _apply_recompute(self, target: Ioc, now: str,
+                         weights: object | None = None) -> IocStatus:
         """按给定时刻把聚合字段物化到 target（可为副本），返回旧状态。
 
         过期与否取决于判定时刻，因此读取与写入都需要重新物化。
+        weights 为 None 时使用注册表当前生效的权重配置。
         """
 
+        config = weights if weights is not None else self._weights.current()
         old_status = target.status
-        target.confidence = aggregate_confidence(target.sources, now)
-        target.verdict = aggregate_verdict(target.sources, now)
+        target.confidence = aggregate_confidence(target.sources, now, config)
+        target.verdict = aggregate_verdict(target.sources, now, config)
+        target.weight_version = getattr(config, "version", 0)
         target.expires_at = derive_expiry(target.sources)
         target.revoked = bool(target.sources) and all(
             o.revoked for o in target.sources.values()
@@ -169,10 +175,17 @@ class IocStore:
         return old_status
 
     def _materialized(self, ioc: Ioc, now: str) -> Ioc:
-        """读取路径：在快照副本上按 now 物化，不触碰存储对象。"""
+        """读取路径：在快照副本上按 now 物化，不触碰存储对象。
 
+        聚合按指标记录的 weight_version 对应配置物化：查询看到的是
+        "最近一次判定"的结论，权重变更只有经过重判/新写入才会体现，
+        保证判定依据与 weight_version 始终对得上。
+        """
+
+        config = (self._weights.get_version(ioc.weight_version)
+                  or self._weights.current())
         clone = _clone_ioc(ioc)
-        old_status = self._apply_recompute(clone, now)
+        old_status = self._apply_recompute(clone, now, weights=config)
         if old_status is not clone.status:
             clone.history.append(AuditEvent(
                 at=now, batch_id="-", source="-",
@@ -182,6 +195,74 @@ class IocStore:
                        f"全部撤回={clone.revoked}）",
             ))
         return clone
+
+    # --------------------------------------------------- 批量重新判定
+
+    def rejudge_all(self, config: object, *, now: str | None = None,
+                    fail_hook: object | None = None) -> dict[str, int]:
+        """用指定权重配置对全量存量指标做一次原子批量重新判定。
+
+        保证：
+        - 与写入共用同一把锁：重算期间并发投递的批次整体排在重算之前
+          或之后，不会出现新旧权重混用的中间态；
+        - 两阶段提交：先在副本上完成全部计算，任一环节抛错则存储零变更，
+          失败重试安全（幂等）；
+        - 已按该版本权重判定过的指标跳过（重试不产生重复审计记录）；
+        - 过期/撤回指标只重算聚合字段，生命周期规则不变，不会在查询中
+          重新冒出来。
+        """
+
+        now = now or now_iso()
+        version = getattr(config, "version", 0)
+        with self._lock:
+            # 阶段一：全部在副本上计算，任何异常都不会污染存储
+            plans: list[tuple[Ioc, Ioc]] = []
+            for ioc in self._iocs.values():
+                if ioc.weight_version == version:
+                    continue
+                clone = _clone_ioc(ioc)
+                self._apply_recompute(clone, now, weights=config)
+                plans.append((ioc, clone))
+
+            if fail_hook is not None:
+                fail_hook()  # 测试注入点：模拟重算中途失败
+
+            # 阶段二：提交——把聚合字段写回存储对象并追加审计记录
+            changed = 0
+            for ioc, clone in plans:
+                old_status = ioc.status
+                ioc.confidence = clone.confidence
+                ioc.verdict = clone.verdict
+                ioc.weight_version = clone.weight_version
+                ioc.expires_at = clone.expires_at
+                ioc.revoked = clone.revoked
+                ioc.status = clone.status
+                ioc.last_seen = clone.last_seen
+                ioc.updated_at = now
+                ioc.history.append(AuditEvent(
+                    at=now, batch_id="-", source="-",
+                    action="rejudge",
+                    detail=(f"按权重版本 v{version} 重新判定："
+                            f"verdict={ioc.verdict.value} "
+                            f"confidence={ioc.confidence} "
+                            f"status={ioc.status.value}"),
+                ))
+                if old_status is not ioc.status:
+                    ioc.history.append(AuditEvent(
+                        at=now, batch_id="-", source="-",
+                        action=f"transition:{old_status.value}->{ioc.status.value}",
+                        detail=(f"重判触发生命周期迁移：{old_status.value} -> "
+                                f"{ioc.status.value}"),
+                    ))
+                changed += 1
+
+            logger.info(
+                "[批量重判] 权重版本=v%d 重算指标=%d 跳过=%d 总量=%d @ %s",
+                version, changed, len(self._iocs) - changed,
+                len(self._iocs), now,
+            )
+            return {"rejudged": changed, "total": len(self._iocs),
+                    "weight_version": version}
 
     # ------------------------------------------------------- 查询
 
@@ -212,7 +293,7 @@ class IocStore:
                 out.append(view)
             return sorted(out, key=lambda x: x.indicator)
 
-    def all_iocs(self) -> list[Ioc]:
+    def all_iocs(self, *, now: str | None = None) -> list[Ioc]:
         """返回全部指标的快照（含非 ACTIVE，供审计/测试）。"""
 
         now = now or now_iso()
@@ -268,5 +349,6 @@ def _clone_ioc(ioc: Ioc) -> Ioc:
         expires_at=ioc.expires_at,
         revoked=ioc.revoked,
         updated_at=ioc.updated_at,
+        weight_version=ioc.weight_version,
         history=list(ioc.history),
     )

@@ -104,21 +104,39 @@ def live_observations(
     return {s: o for s, o in sources.items() if is_observation_live(o, now)}
 
 
+# ------------------------------------------------------------- 权重适配
+
+def _weight_fn(weights: object):
+    """把可选的权重配置（带 weight_of 方法）归一为取权函数。
+
+    weights 为 None 时所有来源按 1.0 处理，与引入权重机制前完全一致。
+    """
+
+    if weights is None:
+        return lambda _source: 1.0
+    return weights.weight_of
+
+
 # ------------------------------------------------------------- 置信度聚合
 
 def explain_confidence(
-    sources: dict[str, SourceObservation], now: str | None = None
+    sources: dict[str, SourceObservation],
+    now: str | None = None,
+    weights: object | None = None,
 ) -> tuple[float, str]:
     """聚合置信度并返回 (置信度, 判定依据)。
 
     规则（可解释）：
     1. 仅统计当前仍有效、且给出了明确结论（verdict != unknown）的来源；
-    2. 基础置信度取这些来源中的最高置信度；
-    3. 每增加一个独立佐证来源 +0.05，佐证加成上限 0.15；
-    4. 结果四舍五入保留三位小数。
+    2. 每个来源的有效置信度 = 来源权重 × 原始置信度，
+       基础置信度取有效置信度最高的来源；
+    3. 佐证加成 = 0.05 × 其余佐证来源的权重之和，上限 0.15；
+    4. 结果四舍五入保留三位小数；
+    5. 所有来源权重为默认 1.0 时，与未引入权重机制的口径完全一致。
     """
 
     now = now or now_iso()
+    weight_of = _weight_fn(weights)
     live = live_observations(sources, now)
     asserting = {
         s: o for s, o in live.items() if o.verdict is not Verdict.UNKNOWN
@@ -126,64 +144,84 @@ def explain_confidence(
     if not asserting:
         return 0.0, "无任何有效来源给出明确结论，置信度记为 0"
 
-    top_source, top_obs = max(asserting.items(), key=lambda kv: kv[1].confidence)
-    base = Decimal(str(top_obs.confidence))
-    extra_count = len(asserting) - 1
-    bonus = min(_CORROBORATION_CAP, _CORROBORATION_STEP * extra_count)
+    def effective(item: tuple[str, SourceObservation]) -> Decimal:
+        return Decimal(str(weight_of(item[0]))) * Decimal(str(item[1].confidence))
+
+    top_source, top_obs = max(asserting.items(), key=effective)
+    top_weight = Decimal(str(weight_of(top_source)))
+    base = Decimal(str(top_obs.confidence)) * top_weight
+    extra_weight = sum(
+        Decimal(str(weight_of(s))) for s in asserting if s != top_source
+    )
+    bonus = min(_CORROBORATION_CAP, _CORROBORATION_STEP * extra_weight)
     value = (base + bonus).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
     value = min(Decimal("0.999"), value)
     detail = (
-        f"基础置信度 {base} 取最高来源 {top_source}；"
-        f"另有 {extra_count} 个独立佐证来源，加成 {bonus}；"
+        f"基础置信度 {base} = 来源 {top_source} 原始 {top_obs.confidence} "
+        f"× 权重 {top_weight}（有效置信度最高）；"
+        f"其余佐证来源权重合计 {extra_weight}，加成 {bonus}；"
         f"聚合置信度 {value}"
     )
     return float(value), detail
 
 
 def aggregate_confidence(
-    sources: dict[str, SourceObservation], now: str | None = None
+    sources: dict[str, SourceObservation],
+    now: str | None = None,
+    weights: object | None = None,
 ) -> float:
     """根据各来源观测聚合可解释的置信度。"""
 
-    return explain_confidence(sources, now)[0]
+    return explain_confidence(sources, now, weights)[0]
 
 
 # --------------------------------------------------------------- 判定聚合
 
 def explain_verdict(
-    sources: dict[str, SourceObservation], now: str | None = None
+    sources: dict[str, SourceObservation],
+    now: str | None = None,
+    weights: object | None = None,
 ) -> tuple[Verdict, str]:
     """聚合最终判定并返回 (判定, 判定依据)。
 
     规则（可解释）：
     - 仅采纳当前有效来源的结论；无有效来源时为 unknown；
-    - 恶意与良性结论并存且最高置信度接近（差 <= 0.10）时，
-      因来源冲突降级为 suspicious；
-    - 否则取严重度最高的结论（malicious > suspicious > benign）。
+    - 恶意与良性结论并存时，比较双方有效置信度（权重 × 原始置信度）
+      的最高值，差 <= 0.10 则因来源冲突降级为 suspicious；
+    - 否则取严重度最高的结论（malicious > suspicious > benign）；
+    - 所有来源权重为默认 1.0 时，与未引入权重机制的口径完全一致。
     """
 
     now = now or now_iso()
+    weight_of = _weight_fn(weights)
     live = live_observations(sources, now)
     assertions = [(s, o) for s, o in live.items() if o.verdict is not Verdict.UNKNOWN]
     if not assertions:
         return Verdict.UNKNOWN, "无有效来源结论，判定为 unknown"
 
+    def effective(item: tuple[str, SourceObservation]) -> Decimal:
+        return Decimal(str(weight_of(item[0]))) * Decimal(str(item[1].confidence))
+
     malicious = [(s, o) for s, o in assertions if o.verdict is Verdict.MALICIOUS]
     benign = [(s, o) for s, o in assertions if o.verdict is Verdict.BENIGN]
 
     if malicious and benign:
-        top_mal = max(malicious, key=lambda kv: kv[1].confidence)
-        top_ben = max(benign, key=lambda kv: kv[1].confidence)
-        diff = Decimal(str(top_mal[1].confidence)) - Decimal(str(top_ben[1].confidence))
+        top_mal = max(malicious, key=effective)
+        top_ben = max(benign, key=effective)
+        eff_mal = effective(top_mal)
+        eff_ben = effective(top_ben)
+        diff = eff_mal - eff_ben
         if diff <= _CONFLICT_MARGIN:
             return Verdict.SUSPICIOUS, (
-                f"来源结论冲突：{top_mal[0]} 报恶意({top_mal[1].confidence})，"
-                f"{top_ben[0]} 报良性({top_ben[1].confidence})，差距 {diff} <= "
-                f"{_CONFLICT_MARGIN}，降级为 suspicious"
+                f"来源结论冲突：{top_mal[0]} 报恶意(有效置信度 {eff_mal} = "
+                f"{top_mal[1].confidence} × 权重 {weight_of(top_mal[0])})，"
+                f"{top_ben[0]} 报良性(有效置信度 {eff_ben} = "
+                f"{top_ben[1].confidence} × 权重 {weight_of(top_ben[0])})，"
+                f"差距 {diff} <= {_CONFLICT_MARGIN}，降级为 suspicious"
             )
         return Verdict.MALICIOUS, (
-            f"恶意来源 {top_mal[0]} 置信度 {top_mal[1].confidence} 明显高于"
-            f"良性来源 {top_ben[0]} 的 {top_ben[1].confidence}（差 {diff}），"
+            f"恶意来源 {top_mal[0]} 有效置信度 {eff_mal} 明显高于"
+            f"良性来源 {top_ben[0]} 的 {eff_ben}（差 {diff}），"
             f"判定为 malicious"
         )
 
@@ -193,11 +231,41 @@ def explain_verdict(
 
 
 def aggregate_verdict(
-    sources: dict[str, SourceObservation], now: str | None = None
+    sources: dict[str, SourceObservation],
+    now: str | None = None,
+    weights: object | None = None,
 ) -> Verdict:
     """根据各来源判定聚合最终结论。"""
 
-    return explain_verdict(sources, now)[0]
+    return explain_verdict(sources, now, weights)[0]
+
+
+def explain_contributions(
+    sources: dict[str, SourceObservation],
+    now: str | None = None,
+    weights: object | None = None,
+) -> list[dict[str, object]]:
+    """逐来源列出对最终结论的贡献（权重、有效置信度、是否计入聚合）。"""
+
+    now = now or now_iso()
+    weight_of = _weight_fn(weights)
+    rows: list[dict[str, object]] = []
+    for source in sorted(sources):
+        obs = sources[source]
+        live = is_observation_live(obs, now)
+        asserting = live and obs.verdict is not Verdict.UNKNOWN
+        weight = weight_of(source)
+        effective = round(weight * obs.confidence, 3) if asserting else 0.0
+        rows.append({
+            "source": source,
+            "weight": weight,
+            "confidence": obs.confidence,
+            "verdict": obs.verdict.value,
+            "live": live,
+            "counted": asserting,
+            "effective_confidence": effective,
+        })
+    return rows
 
 
 # ------------------------------------------------------------- 生命周期

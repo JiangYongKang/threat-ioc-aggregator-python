@@ -115,6 +115,7 @@ class Ioc:
     expires_at: str | None = None
     revoked: bool = False
     updated_at: str = ""
+    weight_version: int = 0  # 最近一次聚合判定所用的权重配置版本
     history: list[AuditEvent] = field(default_factory=list)
 
 

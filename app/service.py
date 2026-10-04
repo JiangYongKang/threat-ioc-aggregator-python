@@ -11,10 +11,16 @@ from dataclasses import dataclass
 
 from app.feeds import LoadedFeed, load_all_feeds
 from app.ingestion import BatchRejected, IngestionService
-from app.lifecycle import explain_confidence, explain_verdict, now_iso
+from app.lifecycle import (
+    explain_confidence,
+    explain_contributions,
+    explain_verdict,
+    now_iso,
+)
 from app.logging_utils import get_logger
 from app.models import BatchResult, IocStatus, IocType
 from app.store import IocStore
+from app.weights import WeightRegistry
 
 logger = get_logger(__name__)
 
@@ -42,6 +48,8 @@ class Explanation:
     verdict_basis: str
     sources: tuple[str, ...]
     visible: bool
+    weight_version: int
+    contributions: tuple[dict, ...]
 
 
 class ThreatIocService:
@@ -50,7 +58,8 @@ class ThreatIocService:
     def __init__(self, feeds_dir: str | None = None,
                  max_entries_per_batch: int = 10_000) -> None:
         self.feeds_dir = feeds_dir
-        self.store = IocStore()
+        self.weights = WeightRegistry()
+        self.store = IocStore(self.weights)
         self.ingestion = IngestionService(
             self.store, max_entries_per_batch=max_entries_per_batch
         )
@@ -132,6 +141,55 @@ class ThreatIocService:
                 ))
         return reports
 
+    # ------------------------------------------------- 权重与重判
+
+    def set_weights(self, weights: object, *, note: str = "",
+                    rejudge: bool = True) -> dict:
+        """发布新一版权重配置；默认立即对全量存量指标原子重判。
+
+        返回新配置与重判汇总。配置校验失败抛 WeightConfigError，
+        不产生任何变更。
+        """
+
+        config = self.weights.set_weights(weights, note=note)
+        summary = {"rejudged": 0, "total": self.store.count(),
+                   "weight_version": config.version}
+        if rejudge:
+            summary = self.store.rejudge_all(config)
+        return {
+            "version": config.version,
+            "weights": dict(config.weights),
+            "updated_at": config.updated_at,
+            "note": config.note,
+            "rejudge": summary,
+        }
+
+    def rejudge_all(self) -> dict:
+        """按当前生效的权重配置对全量存量指标重判（幂等）。"""
+
+        return self.store.rejudge_all(self.weights.current())
+
+    def current_weights(self) -> dict:
+        """返回当前生效的权重配置。"""
+
+        config = self.weights.current()
+        return {
+            "version": config.version,
+            "weights": dict(config.weights),
+            "updated_at": config.updated_at,
+            "note": config.note,
+            "default_weight": 1.0,
+        }
+
+    def weight_history(self) -> list[dict]:
+        """返回全部权重变更记录（什么时候被改成了什么）。"""
+
+        return [
+            {"version": c.version, "at": c.at,
+             "weights": dict(c.weights), "note": c.note}
+            for c in self.weights.history()
+        ]
+
     # ------------------------------------------------- 查询
 
     def query(self, indicator: str, *, now: str | None = None):
@@ -140,14 +198,19 @@ class ThreatIocService:
         return self.store.get(indicator, now=now)
 
     def explain(self, indicator: str, *, now: str | None = None):
-        """返回指标结论的可解释视图（含置信度与判定依据）。"""
+        """返回指标结论的可解释视图（含置信度、判定依据与来源权重贡献）。"""
 
         now = now or now_iso()
         ioc = self.store.get(indicator, now=now)
         if ioc is None:
             return None
-        confidence, conf_basis = explain_confidence(ioc.sources, now)
-        verdict, verdict_basis = explain_verdict(ioc.sources, now)
+        # 解释视图与指标记录的 weight_version 对齐：看到的是哪版权重算的，
+        # 依据就按哪版权重解释
+        config = (self.weights.get_version(ioc.weight_version)
+                  or self.weights.current())
+        confidence, conf_basis = explain_confidence(ioc.sources, now, config)
+        verdict, verdict_basis = explain_verdict(ioc.sources, now, config)
+        contributions = explain_contributions(ioc.sources, now, config)
         return Explanation(
             indicator=ioc.indicator,
             status=ioc.status.value,
@@ -157,6 +220,8 @@ class ThreatIocService:
             verdict_basis=verdict_basis,
             sources=tuple(sorted(ioc.sources)),
             visible=ioc.status is IocStatus.ACTIVE,
+            weight_version=ioc.weight_version,
+            contributions=tuple(contributions),
         )
 
     def list_active(self, *, ioc_type: IocType | None = None,

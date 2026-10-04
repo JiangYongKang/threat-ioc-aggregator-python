@@ -17,6 +17,7 @@ from app.ingestion import BatchRejected
 from app.logging_utils import get_logger
 from app.models import BatchRejectReason
 from app.service import ThreatIocService
+from app.weights import WeightConfigError
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,14 @@ class BatchSubmitRequest(BaseModel):
     batch_id: str | None = Field(default=None, description="批次幂等键")
     source_hint: str | None = Field(default=None, description="来源兜底标识")
     entries: Any = Field(default=None, description="条目列表，元素为任意 JSON")
+
+
+class WeightUpdateRequest(BaseModel):
+    """权重配置更新请求体。"""
+
+    weights: Any = Field(default=None, description="{来源: 权重} 映射")
+    note: str = Field(default="", description="变更说明（进入审计历史）")
+    rejudge: bool = Field(default=True, description="是否立即对存量指标重判")
 
 
 def _ioc_to_dict(ioc) -> dict[str, Any]:
@@ -61,6 +70,7 @@ def _ioc_to_dict(ioc) -> dict[str, Any]:
         "expires_at": ioc.expires_at,
         "revoked": ioc.revoked,
         "updated_at": ioc.updated_at,
+        "weight_version": ioc.weight_version,
         "history": [
             {"at": h.at, "batch_id": h.batch_id, "source": h.source,
              "action": h.action, "detail": h.detail}
@@ -162,7 +172,7 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
 
     @app.get("/api/v1/iocs/{indicator:path}/explain")
     def explain_ioc(indicator: str) -> dict[str, Any]:
-        """返回指标置信度与判定结论的人类可读依据。"""
+        """返回指标置信度与判定结论的人类可读依据（含来源权重贡献）。"""
 
         explanation = app.state.service.explain(indicator)
         if explanation is None:
@@ -176,7 +186,41 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
             "confidence_basis": explanation.confidence_basis,
             "verdict_basis": explanation.verdict_basis,
             "sources": list(explanation.sources),
+            "weight_version": explanation.weight_version,
+            "contributions": list(explanation.contributions),
         }
+
+    @app.get("/api/v1/weights")
+    def get_weights() -> dict[str, Any]:
+        """查看当前生效的来源权重配置。"""
+
+        return app.state.service.current_weights()
+
+    @app.get("/api/v1/weights/history")
+    def get_weight_history() -> dict[str, Any]:
+        """查看权重变更历史（什么时候被改成了什么）。"""
+
+        return {"history": app.state.service.weight_history()}
+
+    @app.put("/api/v1/weights")
+    def put_weights(req: WeightUpdateRequest) -> dict[str, Any]:
+        """发布新一版权重配置，默认立即对全量存量指标原子重判。"""
+
+        try:
+            return app.state.service.set_weights(
+                req.weights, note=req.note, rejudge=req.rejudge
+            )
+        except WeightConfigError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": exc.reason, "message": exc.detail},
+            ) from exc
+
+    @app.post("/api/v1/rejudge")
+    def rejudge() -> dict[str, Any]:
+        """按当前权重配置对全量存量指标重判（幂等，可安全重试）。"""
+
+        return app.state.service.rejudge_all()
 
 
     @app.get("/api/v1/iocs/{indicator:path}")
