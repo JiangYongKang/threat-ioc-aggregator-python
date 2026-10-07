@@ -20,7 +20,7 @@ from app.lifecycle import (
 from app.logging_utils import get_logger
 from app.models import BatchResult, IocStatus, IocType
 from app.store import IocStore
-from app.weights import WeightRegistry
+from app.weights import WeightPublishError, WeightRegistry
 
 logger = get_logger(__name__)
 
@@ -144,23 +144,71 @@ class ThreatIocService:
     # ------------------------------------------------- 权重与重判
 
     def set_weights(self, weights: object, *, note: str = "",
-                    rejudge: bool = True) -> dict:
-        """发布新一版权重配置；默认立即对全量存量指标原子重判。
+                    rejudge: bool = True,
+                    fail_hook: object | None = None) -> dict:
+        """原子发布新一版权重并（默认）对全量存量指标重判。
 
-        返回新配置与重判汇总。配置校验失败抛 WeightConfigError，
-        不产生任何变更。
+        一致性语义：
+        - **配置与存量一起生效或一起不变**：候选构造（含校验）与全量
+          副本重算都在共享锁内、任何提交之前完成；重算中途出错则权重
+          版本不发布、存量零变更、批次幂等表不动，调用方会收到
+          WeightPublishError（原始异常挂在 __cause__ 上），不会静默吞掉；
+        - **同一份权重失败重试不重复记账**：候选权重与当前版本内容相同
+          时复用原版本号（reused=True），历史不新增条目，最终状态与
+          "一次调权就成功"完全一致；
+        - **与并发投递不混用**：临界期内进入的批次整体在临界区之前
+          （会被本次重判覆盖到新版本）或之后（直接按新权重写入），
+          不会出现一部分指标新权重、一部分旧权重。
+
+        rejudge=False 时只发布配置，存量结论与 weight_version 保持原样，
+        直到手动 rejudge_all() 或新批次写入（发布/解耦两种模式都支持
+        同内容幂等）。
         """
 
-        config = self.weights.set_weights(weights, note=note)
-        summary = {"rejudged": 0, "total": self.store.count(),
-                   "weight_version": config.version}
-        if rejudge:
-            summary = self.store.rejudge_all(config)
+        if not rejudge:
+            # 与主路径一样把候选构造放进锁内，避免并发发布时拿到陈旧版本号
+            with self.store.lock():
+                config, reused = self.weights.candidate(weights, note=note)
+                self.weights.commit(config)
+            return self._weight_publish_result(config, {"rejudged": 0,
+                                                        "total": self.store.count(),
+                                                        "weight_version": config.version},
+                                               reused=reused)
+
+        # 校验在锁外先做一次：非法配置快速失败，且不占用临界区
+        # （candidate 是纯函数式校验，锁内会再确定性地构造一次）。
+        self.weights.candidate(weights, note=note)
+        config, reused = None, False
+        try:
+            with self.store.lock():
+                # 锁内构造候选：拿到相对当前版本的正确版本号，并与全量
+                # 重算、发布、提交处于同一不可分割的临界区。
+                config, reused = self.weights.candidate(weights, note=note)
+                plans = self.store.plan_rejudge(config)
+                if fail_hook is not None:
+                    fail_hook()  # 测试注入点：重算完成、提交发布之前
+                self.weights.commit(config)
+                summary = self.store.commit_rejudge(config, plans)
+        except WeightPublishError:
+            raise
+        except Exception as exc:
+            # 走到这里说明没有发生任何提交：权重未发布、存量零变更。
+            logger.exception(
+                "[权重发布] 候选版本 v%s 的全量重判失败，权重与存量均回滚",
+                config.version,
+            )
+            raise WeightPublishError(config.version, str(exc)) from exc
+
+        return self._weight_publish_result(config, summary, reused=reused)
+
+    @staticmethod
+    def _weight_publish_result(config, summary: dict, *, reused: bool) -> dict:
         return {
             "version": config.version,
             "weights": dict(config.weights),
             "updated_at": config.updated_at,
             "note": config.note,
+            "reused": reused,
             "rejudge": summary,
         }
 

@@ -17,7 +17,7 @@ from app.ingestion import BatchRejected
 from app.logging_utils import get_logger
 from app.models import BatchRejectReason
 from app.service import ThreatIocService
-from app.weights import WeightConfigError
+from app.weights import WeightConfigError, WeightPublishError
 
 logger = get_logger(__name__)
 
@@ -204,7 +204,11 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
 
     @app.put("/api/v1/weights")
     def put_weights(req: WeightUpdateRequest) -> dict[str, Any]:
-        """发布新一版权重配置，默认立即对全量存量指标原子重判。"""
+        """发布新一版权重配置，默认立即对全量存量指标原子重判。
+
+        配置非法返回 422 且不产生任何变更；重判阶段失败返回 500，
+        权重版本与存量数据均保持原样，调用方可拿同一份权重原样重试。
+        """
 
         try:
             return app.state.service.set_weights(
@@ -214,6 +218,18 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=422,
                 detail={"code": exc.reason, "message": exc.detail},
+            ) from exc
+        except WeightPublishError as exc:
+            # 500 + 可区分错误码：整体已回滚，明确告知调用方可以重试
+            logger.exception("[HTTP] 权重发布的存量重判失败，整体回滚")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "weight_publish_failed",
+                    "message": str(exc),
+                    "candidate_version": exc.candidate_version,
+                    "retryable": True,
+                },
             ) from exc
 
     @app.post("/api/v1/rejudge")

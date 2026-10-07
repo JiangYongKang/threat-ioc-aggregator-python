@@ -20,7 +20,11 @@ from app.lifecycle import explain_confidence, explain_verdict
 from app.models import IocStatus, RejectReason, Verdict
 from app.service import ThreatIocService
 from app.store import IocStore
-from app.weights import WeightConfigError, WeightRegistry
+from app.weights import (
+    WeightConfigError,
+    WeightPublishError,
+    WeightRegistry,
+)
 
 NOW = "2026-09-23T00:00:00Z"
 
@@ -508,3 +512,363 @@ def test_config_without_rejudge_does_not_change_query_results():
           view.weight_version)
     assert view.weight_version == 1
     assert view.verdict == "suspicious"      # 新权重整体生效
+
+
+# =====================================================================
+# 服务层原子发布：权重配置与存量重判"要么一起生效、要么都不变"
+# =====================================================================
+
+def _full_state(service):
+    """失败前后比对用的完整状态（结论/置信度/状态/版本/审计条数）。"""
+
+    return {
+        ioc.indicator: (ioc.verdict, ioc.confidence, ioc.status,
+                        ioc.weight_version, len(ioc.history))
+        for ioc in service.store.all_iocs()
+    }
+
+
+def _boom():
+    """模拟重判阶段中途失败。"""
+
+    raise RuntimeError("注入：全量重判中途失败")
+
+
+# =====================================================================
+# 注册表两阶段原语：candidate（不记账）/ commit（发布、同内容去重）
+# =====================================================================
+
+def test_registry_candidate_is_non_mutating_and_commit_publishes():
+    registry = WeightRegistry()
+    print("\n[场景] candidate 只构造不发布，commit 后才生效")
+    config, reused = registry.candidate({"alpha": 2.0}, note="候选")
+    print("[判定依据] 候选:", config.version, "reused=", reused)
+    assert (config.version, reused) == (1, False)
+    assert registry.current().version == 0          # 尚未发布
+    assert [h.version for h in registry.history()] == [0]
+    committed = registry.commit(config)
+    assert committed is config
+    assert registry.current().version == 1
+    assert [h.version for h in registry.history()] == [0, 1]
+
+
+def test_registry_same_content_candidate_reuses_current_version():
+    registry = WeightRegistry()
+    first = registry.set_weights({"alpha": 0.5}, note="首版")
+    print("\n[场景] 同内容 candidate 复用当前版本，commit 不追加历史")
+    again, reused = registry.candidate({"alpha": 0.5}, note="重试同份权重")
+    print("[判定依据] 候选版本=", again.version, "reused=", reused)
+    assert reused is True and again is first
+    committed = registry.commit(again)
+    assert committed is first
+    assert [h.version for h in registry.history()] == [0, 1]
+
+
+def test_registry_stale_candidate_commit_rejected():
+    from app.weights import WeightPublishConflict
+
+    registry = WeightRegistry()
+    stale, _ = registry.candidate({"alpha": 2.0}, note="卡住的候选")
+    registry.set_weights({"beta": 3.0}, note="抢先发布的另一版")
+    print("\n[场景] 未提交候选不占版本号：陈旧 v1 候选在另一内容已发布为 v1 时提交被拒")
+    with pytest.raises(WeightPublishConflict) as exc:
+        registry.commit(stale)
+    print("[判定依据]", exc.value)
+    assert registry.current().version == 1
+    assert registry.current().weights == {"beta": 3.0}
+    assert [h.version for h in registry.history()] == [0, 1]
+
+
+def test_registry_bind_lock_shared_with_store():
+    import threading
+
+    lock = threading.RLock()
+    registry = WeightRegistry(lock=lock)
+    store = IocStore(registry)
+    print("\n[场景] 注册表与存储共享同一把锁")
+    print("[判定依据] store.lock is registry.lock:",
+          store.lock() is registry.lock())
+    assert store.lock() is registry.lock()
+
+
+def test_service_publish_failure_leaves_everything_untouched():
+    """重判中途失败：权重版本、存量结论/版本/审计、批次表全部保持原样。"""
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 服务层调权在重判提交前注入异常")
+    before = _full_state(service)
+    before_versions = [h["version"] for h in service.weight_history()]
+    before_batches = dict(service.store._batches)
+    print("[判定依据] 失败前:", before, "权重历史:", before_versions)
+
+    with pytest.raises(WeightPublishError) as exc:
+        service.set_weights({"alpha": 0.5}, note="会失败的调权",
+                            fail_hook=_boom)
+    print("[判定依据] 调用方收到错误:", exc.value)
+    assert isinstance(exc.value.__cause__, RuntimeError)  # 原始异常未被吞
+
+    # 权重没有对外生效，历史不新增
+    assert service.weights.current().version == 0
+    assert [h["version"] for h in service.weight_history()] == before_versions
+    # 存量结论/版本标记/来源追溯审计全部原样
+    assert _full_state(service) == before
+    # 批次幂等表未被触碰
+    assert service.store._batches == before_batches
+    print("[判定依据] 失败后:", _full_state(service),
+          "权重历史:", [h["version"] for h in service.weight_history()])
+
+
+def test_service_retry_same_weights_equivalent_to_single_success():
+    """同一份权重失败后重试：不重复记账，终态与一次成功完全一致。"""
+
+    weights = {"alpha": 0.5}
+    # 失败 -> 重试成功的服务
+    svc = ThreatIocService()
+    _ingest_sample(svc)
+    with pytest.raises(WeightPublishError):
+        svc.set_weights(weights, note="调权", fail_hook=_boom)
+    result = svc.set_weights(weights, note="调权")
+    print("\n[场景] 失败后同一份权重重试:", result)
+    assert result["version"] == 1
+    assert result["reused"] is False
+    assert result["rejudge"]["rejudged"] == 2
+    assert [h["version"] for h in svc.weight_history()] == [0, 1]
+
+    # 一次成功的参照服务
+    ref = ThreatIocService()
+    _ingest_sample(ref)
+    ref_result = ref.set_weights(weights, note="调权")
+    print("[判定依据] 参照(一次成功):", ref_result)
+    assert _full_state(svc) == _full_state(ref)
+    assert [h["version"] for h in svc.weight_history()] == [0, 1]
+
+    # 再拿同一份权重调一次：复用 v1，不推版本号、不重判、不追加审计
+    state_before = _full_state(svc)
+    again = svc.set_weights(weights, note="同内容再调")
+    print("[判定依据] 同内容再调:", again["version"], "reused=", again["reused"])
+    assert again["version"] == 1 and again["reused"] is True
+    assert again["rejudge"]["rejudged"] == 0
+    assert [h["version"] for h in svc.weight_history()] == [0, 1]
+    assert _full_state(svc) == state_before
+
+
+def test_failure_window_new_batch_uses_old_weights_then_retry_unifies():
+    """失败窗口内投递的新批次按旧权重入库；重试后全部指标版本统一。"""
+
+    svc = ThreatIocService()
+    _ingest_sample(svc)
+    print("\n[场景] 调权失败 -> 窗口内新批次 -> 同份权重重试")
+    with pytest.raises(WeightPublishError):
+        svc.set_weights({"alpha": 0.5}, note="会失败", fail_hook=_boom)
+
+    # 窗口内新批次：权重仍为 v0，新指标必须按 v0 判定（不能混用）
+    svc.submit_batch("window-1", [
+        _good("203.0.113.9", "gamma", confidence=0.6, verdict="suspicious"),
+    ])
+    window_ioc = svc.query("203.0.113.9", now=NOW)
+    print("[判定依据] 窗口内新指标 weight_version=", window_ioc.weight_version)
+    assert window_ioc.weight_version == 0
+    assert service_versions(svc) == {0}
+
+    # 重试成功：存量与窗口期指标一起切到 v1，结论与一次成功一致
+    svc.set_weights({"alpha": 0.5}, note="重试")
+    print("[判定依据] 重试后版本集合:", service_versions(svc))
+    assert service_versions(svc) == {1}
+    assert svc.store.count() == 3
+
+    ref = ThreatIocService()
+    _ingest_sample(ref)
+    ref.submit_batch("window-1", [
+        _good("203.0.113.9", "gamma", confidence=0.6, verdict="suspicious"),
+    ])
+    ref.set_weights({"alpha": 0.5}, note="参照")
+    assert _full_state(svc) == _full_state(ref)
+
+
+def service_versions(service) -> set[int]:
+    return {ioc.weight_version for ioc in service.store.all_iocs()}
+
+
+def test_failed_publish_does_not_revive_expired_or_revoked():
+    """失败不损坏已有数据：过期/撤回指标结论、版本、可见性全部保持。"""
+
+    service = ThreatIocService()
+    service.submit_batch("lc-fail", [
+        _good("192.0.2.30", "alpha", confidence=0.9,
+              expires_at="2026-09-22T00:00:00Z"),  # 已过期
+        _good("192.0.2.31", "alpha", confidence=0.9, revoked=True),  # 已撤回
+        _good("192.0.2.32", "alpha", confidence=0.9),               # 正常
+    ])
+    print("\n[场景] 含过期/撤回/正常指标时调权失败")
+    before = _full_state(service)
+    with pytest.raises(WeightPublishError):
+        service.set_weights({"alpha": 2.0}, note="会失败", fail_hook=_boom)
+
+    assert _full_state(service) == before  # 含审计链在内零变更
+    visible = {i.indicator for i in service.list_active(now=NOW)}
+    print("[判定依据] 失败后可见集合:", visible)
+    assert visible == {"192.0.2.32"}
+    expired = service.query("192.0.2.30", now=NOW)
+    revoked = service.query("192.0.2.31", now=NOW)
+    assert expired.status is IocStatus.EXPIRED
+    assert revoked.status is IocStatus.REVOKED
+    assert expired.weight_version == revoked.weight_version == 0
+
+    # 重试成功后过期/撤回仍不复活
+    service.set_weights({"alpha": 2.0}, note="重试")
+    visible_after = {i.indicator for i in service.list_active(now=NOW)}
+    print("[判定依据] 重试成功后可见集合:", visible_after)
+    assert visible_after == {"192.0.2.32"}
+    assert service.query("192.0.2.30", now=NOW).status is IocStatus.EXPIRED
+    assert service.query("192.0.2.31", now=NOW).status is IocStatus.REVOKED
+
+
+def test_publish_concurrent_with_ingestion_is_linearizable():
+    """重判与并发批次交叉：要么整批在重判前（被覆盖），要么在其后（按新权重）。"""
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 调权重判线程 × 4 个并发投递线程，最终无混用、无丢失")
+
+    def do_publish():
+        service.set_weights({"alpha": 0.5}, note="并发调权")
+
+    def do_ingest(n):
+        service.submit_batch(f"xa-{n}", [
+            _good(f"203.0.113.{20 + n}", source="gamma",
+                  confidence=0.6, verdict="suspicious"),
+        ])
+
+    threads = [threading.Thread(target=do_publish)]
+    threads += [threading.Thread(target=do_ingest, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print("[判定依据] 终态版本集合:", service_versions(service))
+    assert service.store.count() == 6
+    assert service_versions(service) == {1}  # 不存在新旧权重混用
+    assert [h["version"] for h in service.weight_history()] == [0, 1]
+
+    # 并发终态必须与某个合法线性化顺序的结果一致。两种线性化：
+    #  A. 批次先于发布：新指标先按 v0 入库、再被重判覆盖（多 rejudge 审计）；
+    #  B. 发布先于批次：新指标直接按 v1 入库（只有 create 审计）。
+    # 结论/置信度/状态/版本与线性化无关，审计条数则取决于先后，故分开断言。
+    def business_state(svc):
+        return {ind: vals[:4] for ind, vals in _full_state(svc).items()}
+
+    ref_after = ThreatIocService()  # A：先投后调
+    _ingest_sample(ref_after)
+    for n in range(4):
+        ref_after.submit_batch(f"xa-{n}", [
+            _good(f"203.0.113.{20 + n}", "gamma", confidence=0.6,
+                  verdict="suspicious"),
+        ])
+    ref_after.set_weights({"alpha": 0.5}, note="参照")
+
+    ref_before = ThreatIocService()  # B：先调后投
+    _ingest_sample(ref_before)
+    ref_before.set_weights({"alpha": 0.5}, note="参照")
+    for n in range(4):
+        ref_before.submit_batch(f"xa-{n}", [
+            _good(f"203.0.113.{20 + n}", "gamma", confidence=0.6,
+                  verdict="suspicious"),
+        ])
+
+    print("[判定依据] 终态业务字段:", business_state(service))
+    assert business_state(service) == business_state(ref_after) == business_state(ref_before)
+    audit_counts = {ind: vals[4] for ind, vals in _full_state(service).items()}
+    audit_a = {ind: vals[4] for ind, vals in _full_state(ref_after).items()}
+    audit_b = {ind: vals[4] for ind, vals in _full_state(ref_before).items()}
+    assert audit_counts in (audit_a, audit_b)  # 恰好是两种线性化之一
+
+
+def test_concurrent_same_weight_publishes_dedup_to_one_version():
+    """多线程并发发布同一份权重：只记一版，失败/竞争不把版本号多推。"""
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 4 个线程并发发布完全相同的权重")
+    errors: list[BaseException] = []
+
+    def do_publish():
+        try:
+            service.set_weights({"alpha": 0.5}, note="并发同权重")
+        except BaseException as exc:  # noqa: BLE001 - 记录而非吞掉
+            errors.append(exc)
+
+    threads = [threading.Thread(target=do_publish) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print("[判定依据] 异常数:", len(errors),
+          "权重历史:", [h["version"] for h in service.weight_history()])
+    assert errors == []
+    assert service.weights.current().version == 1
+    assert [h["version"] for h in service.weight_history()] == [0, 1]
+    assert service_versions(service) == {1}
+
+
+def test_publish_only_path_dedups_same_weights_without_rejudging():
+    """rejudge=False 的发布路径同样幂等：同内容不推版本，存量版本标记不变。"""
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 只发布不重判，同内容连发两次")
+    r1 = service.set_weights({"alpha": 0.5}, note="只发配置", rejudge=False)
+    r2 = service.set_weights({"alpha": 0.5}, note="同内容再发", rejudge=False)
+    print("[判定依据] 第一次:", r1["version"], "第二次:", r2["version"],
+          "reused:", r2["reused"])
+    assert r1["version"] == 1 and r2["version"] == 1 and r2["reused"] is True
+    assert [h["version"] for h in service.weight_history()] == [0, 1]
+    # 存量仍按 v0，直到手动重判
+    assert service_versions(service) == {0}
+    summary = service.rejudge_all()
+    assert summary["rejudged"] == 2
+    assert service_versions(service) == {1}
+
+
+def test_publish_failure_http_maps_to_500_and_is_retryable(tmp_path):
+    """重判阶段失败经 HTTP 明确反馈（500 + 可区分码 + retryable），非静默。"""
+
+    from fastapi.testclient import TestClient
+
+    from app.api import create_app
+
+    client = TestClient(create_app(feeds_dir=str(tmp_path)))
+    print("\n[场景] HTTP 调权在服务层重判失败（直接注入存储层异常）")
+    client.post("/api/v1/batches", json={
+        "batch_id": "http-fail",
+        "entries": [_good("198.51.100.50", "alpha", confidence=0.9)],
+    })
+    service = client.app.state.service
+
+    def _plan_boom(config, *, now=None):
+        raise RuntimeError("注入：plan 阶段失败")
+
+    service.store.plan_rejudge = _plan_boom
+    resp = client.put("/api/v1/weights",
+                      json={"weights": {"alpha": 0.5}, "note": "http 失败"})
+    print("[判定依据] HTTP", resp.status_code, resp.json())
+    assert resp.status_code == 500
+    detail = resp.json()["detail"]
+    assert detail["code"] == "weight_publish_failed"
+    assert detail["retryable"] is True
+    assert detail["candidate_version"] == 1
+    # 整体回滚：仍停留在 v0
+    assert client.get("/api/v1/weights").json()["version"] == 0
+
+    # 恢复后用同一份权重重试，一次成功
+    from app.store import IocStore as _RealStore  # noqa: F401
+    del service.store.plan_rejudge  # 恢复真实方法
+    resp = client.put("/api/v1/weights",
+                      json={"weights": {"alpha": 0.5}, "note": "http 重试"})
+    print("[判定依据] 重试 HTTP", resp.status_code, resp.json()["version"])
+    assert resp.status_code == 200
+    assert resp.json()["version"] == 1
+    assert [h["version"]
+            for h in client.get("/api/v1/weights/history").json()["history"]] == [0, 1]

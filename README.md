@@ -76,14 +76,17 @@ curl -X POST http://127.0.0.1:8000/api/v1/batches \
     `0.05 × 权重` 加成（上限 +0.15）；
   - 恶意/良性结论冲突时，比较双方最高**有效置信度**，差 ≤ 0.10
     降级为 suspicious。
-- 权重配置**版本化**：每次 `PUT /api/v1/weights` 生成单调递增的版本号；
+- 权重配置**版本化**：每次权重内容发生变化时生成单调递增的版本号；
   每个指标记录 `weight_version`（最近一次判定所用的权重版本），
   变更历史可通过 `GET /api/v1/weights/history` 追溯。
+- **同内容去重**：提交的权重与当前版本完全相同时复用原版本
+  （响应 `reused=true`），不新增版本号、不追加历史——失败后拿同一份
+  权重重试不会把版本号和历史多推一格。
 - 查询 `GET /api/v1/iocs/{indicator}/explain` 的 `contributions` 字段
   逐来源列出权重、原始/有效置信度、是否计入聚合。
 
 ```bash
-# 调权并立即对存量指标重判
+# 调权并立即对存量指标重判（权重发布与重判是同一个原子事务）
 curl -X PUT http://127.0.0.1:8000/api/v1/weights \
   -H 'content-type: application/json' \
   -d '{"weights": {"alpha": 0.5, "gamma": 1.5}, "note": "alpha 噪声大，降权"}'
@@ -91,6 +94,9 @@ curl -X PUT http://127.0.0.1:8000/api/v1/weights \
 
 非法配置（非数值、非正、超过 100、来源名非法）返回 422
 （`invalid_weight_config` / `invalid_weight_value`），且**不产生任何变更**。
+重判阶段失败返回 **500**（`weight_publish_failed`，带
+`retryable=true`/`candidate_version`）：权重版本与存量数据已整体回滚，
+可拿同一份权重原样重试，不会重复记账。
 
 ### 重新判定的触发时机与一致性规则
 
@@ -99,15 +105,22 @@ curl -X PUT http://127.0.0.1:8000/api/v1/weights \
   `POST /api/v1/rejudge` 可随时手动按当前权重重判。
 - **等价性**：重判结果与"用新权重把同样情报重新入库一遍"逐指标一致
   （聚合是纯函数，来源观测在重判中不被修改）。
-- **并发**：重判与批次写入共用同一把锁，重判期间并发投递的批次不丢、
-  不重复计数，也不会出现新旧权重混用的中间态。
-- **原子与幂等**：重算先在副本上完成再一次性提交，中途失败存储零变更；
-  失败重试或重复触发不产生额外效果（已按目标版本判定的指标会跳过）。
-- **生命周期**：过期/撤回指标在重判后仍然不会出现在可见查询中。
+- **原子发布**：`candidate（校验/构造候选，不记账）→ plan_rejudge
+  （副本重算）→ commit 权重 → commit 重判` 四步在权重注册表与存储的
+  **同一把锁**内完成。重判中途出错则权重不发布、存量结论/版本标记/
+  来源审计/批次表全部不变，绝无"权重已生效、结论还是旧权重"的半新半旧。
+- **失败重试**：同一份权重重试复用原候选版本，最终版本序列、指标结论
+  与审计链和"一次就调成功"完全一致；对同内容重复调权返回 `reused=true`。
+- **并发**：重判与批次写入共用同一把锁，窗口内的批次整体排在发布之前
+  （会被重判覆盖）或之后（直接按新权重入库），不丢、不重复计数，
+  也不会出现新旧权重混用的中间态。
+- **数据保护**：失败不改坏任何已有数据——过期/撤回指标的结论、版本与
+  可见性逐字段保持，重判后也不会在可见查询中复活。
+- **生命周期**：过期/撤回指标在重判成功后仍然不会出现在可见查询中。
 
 ### 兼容范围
 
-- 不配权重 = 全部来源 1.0 = 旧口径，原有 61 个用例全部不回归；
+- 不配权重 = 全部来源 1.0 = 旧口径，既有 94 个用例全部不回归；
 - 权重只影响置信度/判定的聚合，不影响入库校验、幂等重放、生命周期、
   拒绝/降级原因的可区分性；
 - 权重配置保存在进程内（与 IOC 存储一致），重启后恢复默认版本 v0。
@@ -137,7 +150,11 @@ uv run pytest -s
 # 只看某类场景
 uv run pytest tests/test_ingestion.py       # 原子性 / 幂等 / 并发
 uv run pytest tests/test_lifecycle.py       # 过期边界 / 撤回 / 置信度
-uv run pytest tests/test_weights.py         # 权重生效 / 重判一致性 / 失败重试
+uv run pytest tests/test_weights.py         # 权重生效 / 发布原子性 / 失败重试 / 并发交叉
+
+# 只跑"调权失败与重试"语义的用例（-s 可看到每个场景的[场景]/[判定依据]日志）
+uv run pytest tests/test_weights.py -s -k "publish_failure or retry_same or window or dedup"
+uv run pytest tests/test_weights.py -s -k "linearizable or 500"      # 并发线性化与错误反馈
 uv run pytest tests/test_service_feeds.py   # 多来源文件端到端
 uv run pytest tests/test_api.py             # HTTP 行为与错误码
 ```

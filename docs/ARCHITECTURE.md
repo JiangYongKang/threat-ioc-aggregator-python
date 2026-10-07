@@ -7,15 +7,15 @@ app/
 ├── models.py       # 枚举与数据结构（统一模型、批次结果、审计事件）
 ├── normalizer.py   # 多来源字段归一化、指标值规范化、类型推断、拒绝/降级判定
 ├── lifecycle.py    # 时刻解析、加权置信度/结论聚合、状态推导（纯函数，无 I/O）
-├── weights.py      # 来源可信度权重：版本化配置、校验、变更历史
-├── store.py        # 线程安全内存存储：去重合并、按查询时刻物化、原子批量重判
+├── weights.py      # 来源可信度权重：版本化配置、校验、同内容去重、两阶段发布
+├── store.py        # 线程安全内存存储：去重合并、按查询时刻物化、plan/commit 原子重判
 ├── ingestion.py    # 批次校验、逐条归一、幂等重放、全局锁串行化写入
 ├── feeds.py        # 本地 JSON 情报文件发现与加载（模拟来源推送）
-├── service.py      # 门面：组装存储+入库+权重+文件加载，提供可解释查询
+├── service.py      # 门面：组装存储+入库+权重+文件加载，提供可解释查询与原子调权
 ├── api.py          # FastAPI：HTTP 接口与启动加载
 └── logging_utils.py
 data/feeds/         # 本地情报样本：alpha/beta/gamma、撤回批次、故意损坏文件
-tests/              # 81 个测试，日志用 -s 打印"输入批次/判定依据"
+tests/              # 94 个测试，日志用 -s 打印"输入批次/判定依据"
 main.py             # uvicorn main:app 入口
 ```
 
@@ -114,11 +114,61 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
   可查到"什么时候、被改成了什么、备注是什么"；
 - 每个 `Ioc` 记录 `weight_version`：最近一次聚合判定用的是哪一版权重，
   重判时也会在 `history` 里追加 `rejudge` 审计事件。
+- **同内容去重（重试不重复记账）**：发布的权重与当前版本内容完全相同时，
+  复用原配置快照（响应里 `reused=true`），**不新增版本号、不追加历史**。
+  因此"调权在重判阶段失败 → 拿同一份权重重试"与一次调成功的最终状态、
+  版本序列、指标审计链完全一致
+  （`test_service_retry_same_weights_equivalent_to_single_success`）。
 
-### 4.2 批量重新判定（`IocStore.rejudge_all`）
+### 4.2 权重发布与存量重判的原子提交
+
+`PUT /api/v1/weights`（默认 `rejudge=true`）走一条**两阶段原子提交**
+流水线；`ThreatIocService.set_weights` 让 `IocStore` 与 `WeightRegistry`
+共用**同一把可重入锁**（`IocStore` 装配时 `bind_lock` 绑定），批次写入
+也抢这把锁：
+
+```
+┌─ 临界区（权重注册表 / 存储 / 批次写入共用同一把锁）────────────────────┐
+│ 1. registry.candidate(weights)   校验 + 构造候选快照（不发布、不记账）  │
+│ 2. store.plan_rejudge(candidate) 全量指标在副本上重算（不碰存储对象）   │
+│    （fail_hook：测试在"算完未提交"处注入失败）                         │
+│ 3. registry.commit(candidate)    发布权重版本                          │
+│ 4. store.commit_rejudge(plans)   一次性写回结论/版本并追加审计         │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+一致性与失败语义：
+
+- **要么一起生效、要么都不变**：第 1、2 步是纯计算，任何异常都发生在
+  任何提交之前——权重版本不发布，存量结论 / `weight_version` /
+  来源追溯审计 / 批次幂等表全部保持原样
+  （`test_service_publish_failure_leaves_everything_untouched`）。
+  重判阶段的异常由服务层包装为 `WeightPublishError`（原始异常挂在
+  `__cause__`）并打 ERROR 日志，HTTP 映射为 **500**
+  `weight_publish_failed`（响应体带 `retryable=true` 与
+  `candidate_version`），**不静默吞掉**，调用方可拿同一份权重原样重试
+  （`test_publish_failure_http_maps_to_500_and_is_retryable`）；
+- **失败窗口不混用**：临界区内并发投递的批次只能整体排在临界区之前
+  （会被第 2 步重算覆盖到新版本）或之后（upsert 直接读到新权重、按
+  新版本写入）。失败时权重未发布，窗口内新批次一律按旧权重入库，
+  重试成功后全部指标统一到新版本——不存在"一部分新权重、一部分旧权重"
+  （`test_failure_window_new_batch_uses_old_weights_then_retry_unifies`、
+  `test_publish_concurrent_with_ingestion_is_linearizable`）；
+- **失败不损坏已有数据**：过期 / 撤回指标的结论、版本标记与可见性在
+  失败前后逐字段一致；重试成功后仍不会在 `GET /iocs` 中复活
+  （`test_failed_publish_does_not_revive_expired_or_revoked`）；
+- **并发同内容去重**：多线程并发发布完全相同的权重只记一版
+  （`test_concurrent_same_weight_publishes_dedup_to_one_version`）。
+
+> 第 3、4 步都是锁内纯内存赋值，正常流程不抛错；注册表与存储共享锁也让
+> 并发读者不可能观察到"已发布未重判"的中间态。将来替换为真实数据库时，
+> 应把这四步放进同一个数据库事务。
+
+### 4.3 批量重新判定（`plan_rejudge` + `commit_rejudge` / `rejudge_all`）
 
 权重调整后对全量存量指标做一次重判（`PUT /api/v1/weights` 默认立即触发，
-也可 `POST /api/v1/rejudge` 手动触发）。一致性规则：
+也可 `POST /api/v1/rejudge` 手动触发；后者本质是在同一临界区内顺序调用
+`plan_rejudge` + `commit_rejudge`）。一致性规则：
 
 - **与重新入库等价**：聚合是 `(来源观测, 权重快照, 判定时刻)` 的纯函数，
   来源观测在重判中不被修改，因此重判结果与"用新权重把同样情报重新
@@ -127,9 +177,10 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
   排在重判之前或之后——之前的会被重判覆盖到新版本，之后的直接按新
   权重写入，不存在新旧权重混用的中间态，也不丢数据、不重复计数
   （`test_rejudge_concurrent_with_ingestion`）；
-- **原子性**：两阶段提交——先在快照副本上完成全部计算，再一次性写回；
-  中途任何失败存储零变更（`test_rejudge_failure_is_atomic_and_retryable`
-  用 `fail_hook` 注入失败验证）；
+- **原子性**：`plan_rejudge`（快照副本计算）+ `commit_rejudge`
+  （一次性写回）两阶段；中途任何失败存储零变更
+  （`test_rejudge_failure_is_atomic_and_retryable` 用 `fail_hook`
+  在提交前注入失败验证）；
 - **幂等重试**：已按目标版本判定过的指标直接跳过，失败重试或重复触发
   不产生额外效果、不重复追加审计记录；
 - **生命周期不变**：重判只重算聚合字段，过期/撤回指标状态规则不变，
@@ -201,10 +252,12 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
 
 ## 8. 验证与扩展
 
-- 运行：`uv run pytest -s`（81 个用例，日志打印每个用例的输入批次与
+- 运行：`uv run pytest -s`（94 个用例，日志打印每个用例的输入批次与
   判定依据；INFO 日志在并发用例中可见线程交织但结果确定）。
 - 权重与重判行为集中在 `tests/test_weights.py`：默认兼容、权重生效、
-  重判与重新入库一致、并发交叉、失败重试幂等、畸形条目可区分。
+  重判与重新入库一致、**发布原子性（失败整体回滚）、同内容失败重试不
+  重复记账、失败窗口与并发投递线性化、并发同内容去重、失败不复活过期/
+  撤回、HTTP 500 错误反馈**、生命周期不回归、畸形条目可区分。
 - 扩展一个新来源：在 `SOURCE_PROFILES` 增加一个 `SourceProfile`
   （字段别名 + 默认值），在 `data/feeds/` 放一个同名 JSON 即可，无需改动
   聚合与生命周期逻辑。
