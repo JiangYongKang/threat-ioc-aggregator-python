@@ -19,8 +19,11 @@ from app.lifecycle import (
 )
 from app.logging_utils import get_logger
 from app.models import BatchResult, IocStatus, IocType
-from app.store import IocStore
+from app.store import IocStore, RejudgeFailed
 from app.weights import WeightRegistry
+
+__all__ = ["Explanation", "FeedIngestionReport", "RejudgeFailed",
+           "ThreatIocService"]
 
 logger = get_logger(__name__)
 
@@ -144,18 +147,32 @@ class ThreatIocService:
     # ------------------------------------------------- 权重与重判
 
     def set_weights(self, weights: object, *, note: str = "",
-                    rejudge: bool = True) -> dict:
-        """发布新一版权重配置；默认立即对全量存量指标原子重判。
+                    rejudge: bool = True,
+                    fail_hook: object | None = None) -> dict:
+        """发布新一版权重配置；默认与全量存量重判**原子**完成。
 
-        返回新配置与重判汇总。配置校验失败抛 WeightConfigError，
-        不产生任何变更。
+        原子语义（rejudge=True，默认）：
+        - 配置校验失败抛 WeightConfigError，不产生任何变更；
+        - 重算阶段失败抛 WeightPublishError：权重版本未发布、存量未改动，
+          两边保持对齐，拿同一份权重再次调用不会多出版本/历史，最终状态
+          与一次成功完全一致；
+        - 成功时权重发布与存量重判在同一存储锁临界区内一次性对外可见，
+          期间并发投递的批次整体排在其前或其后，不存在新旧权重混用。
+
+        rejudge=False 时只发布配置（仍与批次写入互斥），查询结论保持按
+        各指标当前 weight_version 的口径，直到下一次重判或新写入。
+
+        fail_hook 仅供测试注入：在重算完成、提交前调用，用于稳定复现失败。
         """
 
-        config = self.weights.set_weights(weights, note=note)
-        summary = {"rejudged": 0, "total": self.store.count(),
-                   "weight_version": config.version}
         if rejudge:
-            summary = self.store.rejudge_all(config)
+            config, summary = self.store.publish_weights_and_rejudge(
+                weights, note=note, fail_hook=fail_hook
+            )
+        else:
+            config = self.store.commit_weights_only(weights, note=note)
+            summary = {"rejudged": 0, "total": self.store.count(),
+                       "weight_version": config.version}
         return {
             "version": config.version,
             "weights": dict(config.weights),

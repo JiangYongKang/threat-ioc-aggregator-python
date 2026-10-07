@@ -34,6 +34,14 @@ class WeightConfigError(ValueError):
         self.detail = detail
 
 
+class WeightTransactionError(RuntimeError):
+    """权重发布事务的内部状态不合法（如候选版本与当前版本不连续）。
+
+    属于防御性错误：正常事务编排不会触发；触发即说明锁/并发编排有缺陷，
+    此时注册表未发生任何变更。
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class WeightConfig:
     """一版不可变的来源权重配置。"""
@@ -115,27 +123,58 @@ class WeightRegistry:
         with self._lock:
             return self._configs.get(version)
 
-    def set_weights(self, weights: object, *, note: str = "",
-                    now: str | None = None) -> WeightConfig:
-        """校验并发布新一版权重配置，返回新配置快照。"""
+    def stage_weights(self, weights: object, *, note: str = "",
+                      now: str | None = None) -> WeightConfig:
+        """校验并构造下一版候选配置快照，但**不发布**（无任何副作用）。
+
+        用于"发布配置 + 存量重判"事务：调用方先 stage 拿到候选版本，
+        在副本上完成重算后再调用 commit_weights 一次性发布；
+        stage 之后若中途失败，注册表状态完全不变，可安全重试。
+        """
 
         cleaned = validate_weights(weights)
         with self._lock:
-            config = WeightConfig(
+            return WeightConfig(
                 version=self._current.version + 1,
                 weights=cleaned,
                 updated_at=now or now_iso(),
                 note=note,
             )
+
+    def commit_weights(self, config: WeightConfig) -> None:
+        """把 stage 出来的候选配置正式发布为当前版本并写入历史。
+
+        只接受"紧邻当前版本的下一版"，防止并发/重试下跳号或重复记账。
+        """
+
+        with self._lock:
+            expected = self._current.version + 1
+            if config.version != expected:
+                raise WeightTransactionError(
+                    f"候选权重版本 v{config.version} 不是当前版本 "
+                    f"v{self._current.version} 的下一版（应为 v{expected}），"
+                    "拒绝发布以防跳号或重复记账"
+                )
             self._current = config
             self._configs[config.version] = config
             self._history.append(WeightChange(
                 version=config.version, at=config.updated_at,
-                weights=dict(cleaned), note=note,
+                weights=dict(config.weights), note=config.note,
             ))
             logger.info("[权重变更] version=%d weights=%s note=%s",
-                        config.version, cleaned, note)
-            return config
+                        config.version, dict(config.weights), config.note)
+
+    def set_weights(self, weights: object, *, note: str = "",
+                    now: str | None = None) -> WeightConfig:
+        """校验并发布新一版权重配置，返回新配置快照。
+
+        等价于 stage_weights + commit_weights 的独立快捷方式；
+        需要与存量重判组成原子事务时，请改用两阶段方法。
+        """
+
+        config = self.stage_weights(weights, note=note, now=now)
+        self.commit_weights(config)
+        return config
 
     def history(self) -> list[WeightChange]:
         """返回全部权重变更记录（含初始默认版本）。"""

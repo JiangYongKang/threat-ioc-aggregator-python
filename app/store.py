@@ -29,9 +29,29 @@ from app.models import (
     IocType,
     SourceObservation,
 )
-from app.weights import WeightRegistry
+from app.weights import (
+    WeightConfig,
+    WeightRegistry,
+    validate_weights,
+)
 
 logger = get_logger(__name__)
+
+
+class RejudgeFailed(RuntimeError):
+    """批量重新判定在提交前失败（重算阶段异常）。
+
+    抛出时权重配置与存量指标均未发生任何变更，调用方可安全重试。
+    原始异常挂在 __cause__ 上，不会被静默吞掉。
+    """
+
+    def __init__(self, version: int, detail: str) -> None:
+        super().__init__(
+            f"按权重版本 v{version} 的批量重判在提交前失败，全部变更已回滚："
+            f"{detail}"
+        )
+        self.version = version
+        self.detail = detail
 
 
 class IocStore:
@@ -198,6 +218,56 @@ class IocStore:
 
     # --------------------------------------------------- 批量重新判定
 
+    def _plan_rejudge(self, config: WeightConfig, now: str,
+                      ) -> list[tuple[str, Ioc]]:
+        """在副本上为所有需要重判的指标出计划（纯计算，不触碰存储）。
+
+        任一指标的重算抛错都会中断，已算出的副本全部丢弃，存储零变更。
+        过期/撤回指标同样只重算聚合字段：生命周期规则不变，不会因此复活。
+        返回 (指标键, 完整新快照) 列表。
+        """
+
+        plans: list[tuple[str, Ioc]] = []
+        for indicator, ioc in self._iocs.items():
+            if ioc.weight_version == config.version:
+                continue  # 已按目标版本判定过：重试/重复触发时跳过，不重复记账
+            clone = _clone_ioc(ioc)
+            old_status = self._apply_recompute(clone, now, weights=config)
+            clone.updated_at = now
+            clone.history.append(AuditEvent(
+                at=now, batch_id="-", source="-",
+                action="rejudge",
+                detail=(f"按权重版本 v{config.version} 重新判定："
+                        f"verdict={clone.verdict.value} "
+                        f"confidence={clone.confidence} "
+                        f"status={clone.status.value}"),
+            ))
+            if old_status is not clone.status:
+                clone.history.append(AuditEvent(
+                    at=now, batch_id="-", source="-",
+                    action=f"transition:{old_status.value}->{clone.status.value}",
+                    detail=(f"重判触发生命周期迁移：{old_status.value} -> "
+                            f"{clone.status.value}"),
+                ))
+            plans.append((indicator, clone))
+        return plans
+
+    def _commit_plan(self, plans: list[tuple[str, Ioc]]) -> None:
+        """把整份重判计划一次性提交到存储。
+
+        计划里的每项都是完整快照；这里先构造好替换后的新字典，再用
+        **单次属性赋值**整体替换 self._iocs——提交点只有一次引用写入，
+        其他线程（以及任何读取路径）看到的要么是整份旧表、要么是整份
+        新表，绝不存在同一时刻一部分指标新、一部分指标旧的混用状态。
+        """
+
+        if not plans:
+            return
+        new_iocs = dict(self._iocs)
+        for indicator, clone in plans:
+            new_iocs[indicator] = clone
+        self._iocs = new_iocs
+
     def rejudge_all(self, config: object, *, now: str | None = None,
                     fail_hook: object | None = None) -> dict[str, int]:
         """用指定权重配置对全量存量指标做一次原子批量重新判定。
@@ -206,7 +276,7 @@ class IocStore:
         - 与写入共用同一把锁：重算期间并发投递的批次整体排在重算之前
           或之后，不会出现新旧权重混用的中间态；
         - 两阶段提交：先在副本上完成全部计算，任一环节抛错则存储零变更，
-          失败重试安全（幂等）；
+          失败以 RejudgeFailed 反馈给调用方（不静默吞错），重试安全；
         - 已按该版本权重判定过的指标跳过（重试不产生重复审计记录）；
         - 过期/撤回指标只重算聚合字段，生命周期规则不变，不会在查询中
           重新冒出来。
@@ -215,47 +285,21 @@ class IocStore:
         now = now or now_iso()
         version = getattr(config, "version", 0)
         with self._lock:
-            # 阶段一：全部在副本上计算，任何异常都不会污染存储
-            plans: list[tuple[Ioc, Ioc]] = []
-            for ioc in self._iocs.values():
-                if ioc.weight_version == version:
-                    continue
-                clone = _clone_ioc(ioc)
-                self._apply_recompute(clone, now, weights=config)
-                plans.append((ioc, clone))
+            try:
+                plans = self._plan_rejudge(config, now)
+                if fail_hook is not None:
+                    fail_hook()  # 测试注入点：模拟重算全部完成后、提交前失败
+            except Exception as exc:
+                if isinstance(exc, RejudgeFailed):
+                    raise
+                logger.exception(
+                    "[批量重判] 权重版本=v%d 重算阶段失败，存储零变更 @ %s",
+                    version, now,
+                )
+                raise RejudgeFailed(version, str(exc)) from exc
 
-            if fail_hook is not None:
-                fail_hook()  # 测试注入点：模拟重算中途失败
-
-            # 阶段二：提交——把聚合字段写回存储对象并追加审计记录
-            changed = 0
-            for ioc, clone in plans:
-                old_status = ioc.status
-                ioc.confidence = clone.confidence
-                ioc.verdict = clone.verdict
-                ioc.weight_version = clone.weight_version
-                ioc.expires_at = clone.expires_at
-                ioc.revoked = clone.revoked
-                ioc.status = clone.status
-                ioc.last_seen = clone.last_seen
-                ioc.updated_at = now
-                ioc.history.append(AuditEvent(
-                    at=now, batch_id="-", source="-",
-                    action="rejudge",
-                    detail=(f"按权重版本 v{version} 重新判定："
-                            f"verdict={ioc.verdict.value} "
-                            f"confidence={ioc.confidence} "
-                            f"status={ioc.status.value}"),
-                ))
-                if old_status is not ioc.status:
-                    ioc.history.append(AuditEvent(
-                        at=now, batch_id="-", source="-",
-                        action=f"transition:{old_status.value}->{ioc.status.value}",
-                        detail=(f"重判触发生命周期迁移：{old_status.value} -> "
-                                f"{ioc.status.value}"),
-                    ))
-                changed += 1
-
+            self._commit_plan(plans)
+            changed = len(plans)
             logger.info(
                 "[批量重判] 权重版本=v%d 重算指标=%d 跳过=%d 总量=%d @ %s",
                 version, changed, len(self._iocs) - changed,
@@ -263,6 +307,72 @@ class IocStore:
             )
             return {"rejudged": changed, "total": len(self._iocs),
                     "weight_version": version}
+
+    def publish_weights_and_rejudge(self, weights: object, *, note: str = "",
+                                    now: str | None = None,
+                                    fail_hook: object | None = None
+                                    ) -> tuple[WeightConfig, dict[str, int]]:
+        """原子地"发布新一版权重 + 对全量存量指标重判"。
+
+        单事务语义（全程持有存储锁，与批次写入互斥）：
+        - 配置非法（WeightConfigError）：在任何变更前抛出，权重与存量都不变；
+        - 重算阶段失败：权重版本尚未发布、存量尚未改动，两边都保持原样，
+          抛 RejudgeFailed，调用方拿同一份权重重试不会多出版本、
+          不重复记账，最终结果与一次成功完全一致；
+        - 只有重算全部成功，才在同一临界区内先提交权重配置（版本号+历史
+          只记这一次）、再整表原子替换；其他线程观察不到半新半旧状态。
+        """
+
+        # 非法配置在校验阶段直接拒绝（无副作用）；合法配置的候选版本号
+        # 必须在存储锁内读取当前版本后构造，避免两个并发事务拿到同一版本号
+        validate_weights(weights)
+        now = now or now_iso()
+        with self._lock:
+            candidate = self._weights.stage_weights(
+                weights, note=note, now=now
+            )
+            try:
+                plans = self._plan_rejudge(candidate, now)
+                if fail_hook is not None:
+                    fail_hook()  # 测试注入点：模拟重算全部完成后、提交前失败
+            except Exception as exc:
+                if isinstance(exc, RejudgeFailed):
+                    raise
+                logger.exception(
+                    "[权重发布] v%d 配套重判在提交前失败，配置与存量均不变更 @ %s",
+                    candidate.version, now,
+                )
+                raise RejudgeFailed(candidate.version, str(exc)) from exc
+
+            # 提交点：版本发布与存量重判在同一临界区内连续完成
+            self._weights.commit_weights(candidate)
+            self._commit_plan(plans)
+            changed = len(plans)
+            logger.info(
+                "[权重发布] version=v%d 已发布并完成原子重判：重算=%d 跳过=%d "
+                "总量=%d @ %s",
+                candidate.version, changed, len(self._iocs) - changed,
+                len(self._iocs), now,
+            )
+            summary = {"rejudged": changed, "total": len(self._iocs),
+                       "weight_version": candidate.version}
+            return candidate, summary
+
+    def commit_weights_only(self, weights: object, *, note: str = "",
+                            now: str | None = None) -> WeightConfig:
+        """只发布权重配置、不触发存量重判（查询仍按各指标当前版本口径）。
+
+        与批次写入共用存储锁，保证配置发布点与批次写入点线性一致。
+        """
+
+        validate_weights(weights)
+        now = now or now_iso()
+        with self._lock:
+            candidate = self._weights.stage_weights(
+                weights, note=note, now=now
+            )
+            self._weights.commit_weights(candidate)
+            return candidate
 
     # ------------------------------------------------------- 查询
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
 
 from app.logging_utils import get_logger
 from app.models import (
@@ -42,8 +41,10 @@ class IngestionService:
     def __init__(self, store: object, max_entries_per_batch: int = 10_000) -> None:
         self.store = store
         self.max_entries_per_batch = max_entries_per_batch
-        # 串行化所有批次的"判定 + 写入"临界区
-        self._global_lock = threading.RLock()
+        # 与存储/重判共用同一把锁：整个"幂等判定 + 全部 upsert + 批次登记"
+        # 临界区与批量重判、权重发布互斥，保证并发批次不会与重判交错，
+        # 既不会出现新旧权重混用，也不会丢数据或重复计数。
+        self._global_lock = store.lock()
 
     # ------------------------------------------------- 批次指纹
 

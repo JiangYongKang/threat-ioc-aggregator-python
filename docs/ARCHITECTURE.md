@@ -15,7 +15,7 @@ app/
 ├── api.py          # FastAPI：HTTP 接口与启动加载
 └── logging_utils.py
 data/feeds/         # 本地情报样本：alpha/beta/gamma、撤回批次、故意损坏文件
-tests/              # 81 个测试，日志用 -s 打印"输入批次/判定依据"
+tests/              # 88 个测试，日志用 -s 打印"输入批次/判定依据"
 main.py             # uvicorn main:app 入口
 ```
 
@@ -115,7 +115,7 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
 - 每个 `Ioc` 记录 `weight_version`：最近一次聚合判定用的是哪一版权重，
   重判时也会在 `history` 里追加 `rejudge` 审计事件。
 
-### 4.2 批量重新判定（`IocStore.rejudge_all`）
+### 4.2 批量重新判定（`IocStore.publish_weights_and_rejudge` / `rejudge_all`）
 
 权重调整后对全量存量指标做一次重判（`PUT /api/v1/weights` 默认立即触发，
 也可 `POST /api/v1/rejudge` 手动触发）。一致性规则：
@@ -123,22 +123,54 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
 - **与重新入库等价**：聚合是 `(来源观测, 权重快照, 判定时刻)` 的纯函数，
   来源观测在重判中不被修改，因此重判结果与"用新权重把同样情报重新
   入库一遍"逐指标一致（`test_rejudge_matches_fresh_ingest_with_same_weights`）；
-- **并发安全**：重判与批次写入共用同一把存储锁，并发投递的批次整体
-  排在重判之前或之后——之前的会被重判覆盖到新版本，之后的直接按新
-  权重写入，不存在新旧权重混用的中间态，也不丢数据、不重复计数
-  （`test_rejudge_concurrent_with_ingestion`）；
-- **原子性**：两阶段提交——先在快照副本上完成全部计算，再一次性写回；
-  中途任何失败存储零变更（`test_rejudge_failure_is_atomic_and_retryable`
+- **发布原子性（关键）**：默认路径下"发布权重版本 + 存量重判"是
+  **同一个事务**（`publish_weights_and_rejudge`），全程持有与批次写入
+  **共用的存储锁**：
+  1. 锁外先做配置校验，非法配置直接抛 `WeightConfigError`（HTTP 422），
+     不开启事务、无任何变更；
+  2. 锁内 `stage_weights()` 读取当前版本号构造候选配置（不发布）；
+  3. `_plan_rejudge()` 在**副本**上完成全量重算并生成完整新快照计划，
+     任一环节异常都会中断，副本整体丢弃，抛 `RejudgeFailed`（带原始
+     异常链，HTTP 500 `weight_publish_rejudge_failed`）——此时候选配置
+     尚未提交、存量尚未替换，**权重与存量要么一起生效、要么都不变**；
+  4. 全部成功后才在临界区内连续 `commit_weights()`（版本号 + 历史只在
+     此刻记一次）与 `_commit_plan()`（用完整快照对象**替换字典引用**，
+     其他线程读到的要么整个是旧指标、要么整个是新指标）。
+  因此失败后事后查询绝不会看到"新版本权重已生效但存量仍是旧结论"的
+  撕裂状态（`test_set_weights_failure_leaves_config_and_data_both_unchanged`）；
+- **失败重试不重复记账**：失败不占版本号、不写历史；拿同一份权重再次
+  调权发布的仍是紧邻的下一版（首次失败后成功仍是 v1），终态与一次
+  成功逐字段一致，存量与新批次的 `weight_version` 统一对齐
+  （`test_retry_same_weights_after_failure_records_single_version`）；
+- **并发安全**：`IngestionService` 的批次临界区直接复用 `IocStore.lock()`，
+  与重判/权重发布互斥——并发投递的批次整体排在事务之前（按旧权重入库，
+  随后被重判覆盖）或之后（直接按新权重入库），不存在新旧权重混用的
+  中间态，也不丢数据、不重复计数
+  （`test_rejudge_concurrent_with_ingestion`、
+  `test_failed_reweight_concurrent_with_ingestion_never_mixes_versions`
+  用 `threading.Barrier` 把批次钉在失败事务的提交窗口上复现）；
+- **原子性**：两阶段提交——先在快照副本上完成全部计算，再一次性替换；
+  中途任何失败权重与存量双零变更（`test_rejudge_failure_is_atomic_and_retryable`
   用 `fail_hook` 注入失败验证）；
 - **幂等重试**：已按目标版本判定过的指标直接跳过，失败重试或重复触发
   不产生额外效果、不重复追加审计记录；
-- **生命周期不变**：重判只重算聚合字段，过期/撤回指标状态规则不变，
-  不会在 `GET /iocs` 中重新出现
-  （`test_expired_and_revoked_stay_hidden_after_rejudge`）。
+- **失败不改坏已有数据**：失败后结论、版本标记、来源追溯（`sources` /
+  `history`）全部原样；过期/撤回指标状态规则不变，不会在 `GET /iocs`
+  中重新出现（`test_failure_preserves_conclusions_provenance_and_hidden_lifecycle`、
+  `test_expired_and_revoked_stay_hidden_after_rejudge`）；
+- **错误不静默**：重算失败经 `RejudgeFailed` 明确反馈（服务层/测试可直接
+  捕获，HTTP 为 500 结构化错误并附"可安全重试"提示，
+  `test_failed_reweight_surfaces_structured_http_error`、
+  `test_manual_rejudge_failure_surfaces_structured_http_error`）；
 - **查询口径与版本对齐**：读取物化按指标记录的 `weight_version`
-  对应的权重配置计算，因此"只发布配置不重判"时查询结论不变；
-  只有重判或新写入才会把指标推进到新版本，判定依据与版本号始终
-  对得上（`test_config_without_rejudge_does_not_change_query_results`）。
+  对应的权重配置计算，因此"只发布配置不重判"（`rejudge=false`）时
+  查询结论不变；只有重判或新写入才会把指标推进到新版本，判定依据与
+  版本号始终对得上（`test_config_without_rejudge_does_not_change_query_results`）。
+
+> 两阶段接口 `WeightRegistry.stage_weights()` / `commit_weights()` 只负责
+> 配置的"构造候选 / 正式发布"；`set_weights()` 保留为不需要配套重判时的
+> 一步快捷方式。候选版本必须是当前版本的紧邻下一版，否则
+> `commit_weights()` 抛 `WeightTransactionError` 防御跳号/重复记账。
 
 ## 5. 生命周期规则
 
@@ -170,13 +202,16 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
 
 ### 6.2 原子写入与并发
 
-`IngestionService` 持有一把进程内 `RLock`，"幂等判定 + 全部 upsert +
-批次结果登记" 在同一临界区内完成。因此：
+`IngestionService` 的批次临界区直接复用 `IocStore.lock()`（同一把进程内
+`RLock`，`upsert` / 批量重判 / 权重发布也都在这把锁上），"幂等判定 +
+全部 upsert + 批次结果登记" 在同一临界区内完成。因此：
 
 - 同一批次被 N 个线程并发提交，结果严格等价于"恰好一次执行 + N-1 次重放"；
 - 多个不同批次（含重叠指标）并发提交，不会出现重复、丢失或部分写入，
   最终指标数与来源集合确定（见 `tests/test_ingestion.py` 中三个并发用例，
-  使用 `threading.Barrier` 最大化竞争）。
+  使用 `threading.Barrier` 最大化竞争）；
+- 批次与"调权 + 存量重判"事务天然互斥：重判不可能夹在同一个批次的两条
+  upsert 之间，从根上消除了部分指标按新权重、部分按旧权重的混用状态。
 
 ### 6.3 幂等重放
 
@@ -201,10 +236,11 @@ POST /api/v1/... ──┘            │  结构非法→BatchRejected（零写
 
 ## 8. 验证与扩展
 
-- 运行：`uv run pytest -s`（81 个用例，日志打印每个用例的输入批次与
+- 运行：`uv run pytest -s`（88 个用例，日志打印每个用例的输入批次与
   判定依据；INFO 日志在并发用例中可见线程交织但结果确定）。
 - 权重与重判行为集中在 `tests/test_weights.py`：默认兼容、权重生效、
-  重判与重新入库一致、并发交叉、失败重试幂等、畸形条目可区分。
+  重判与重新入库一致、并发交叉、失败重试不重复记账、失败原子回滚不改坏
+  数据、HTTP 失败结构化反馈、畸形条目可区分。
 - 扩展一个新来源：在 `SOURCE_PROFILES` 增加一个 `SourceProfile`
   （字段别名 + 默认值），在 `data/feeds/` 放一个同名 JSON 即可，无需改动
   聚合与生命周期逻辑。

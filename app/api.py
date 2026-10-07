@@ -17,6 +17,7 @@ from app.ingestion import BatchRejected
 from app.logging_utils import get_logger
 from app.models import BatchRejectReason
 from app.service import ThreatIocService
+from app.store import RejudgeFailed
 from app.weights import WeightConfigError
 
 logger = get_logger(__name__)
@@ -211,16 +212,41 @@ def create_app(feeds_dir: str | Path | None = None) -> FastAPI:
                 req.weights, note=req.note, rejudge=req.rejudge
             )
         except WeightConfigError as exc:
+            # 422：配置本身非法，校验阶段拒绝，权重与存量均无变更
             raise HTTPException(
                 status_code=422,
                 detail={"code": exc.reason, "message": exc.detail},
+            ) from exc
+        except RejudgeFailed as exc:
+            # 500：配置合法但配套重判在提交前失败；事务已整体回滚，
+            # 权重未发布、存量未改动，调用方可用同一份权重安全重试
+            logger.exception("权重发布的配套重判失败，事务整体回滚")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "weight_publish_rejudge_failed",
+                    "weight_version": exc.version,
+                    "message": exc.detail,
+                    "hint": "权重配置与存量指标均未变更，可使用同一份权重重试",
+                },
             ) from exc
 
     @app.post("/api/v1/rejudge")
     def rejudge() -> dict[str, Any]:
         """按当前权重配置对全量存量指标重判（幂等，可安全重试）。"""
 
-        return app.state.service.rejudge_all()
+        try:
+            return app.state.service.rejudge_all()
+        except RejudgeFailed as exc:
+            logger.exception("手动批量重判失败，存储零变更")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "rejudge_failed",
+                    "weight_version": exc.version,
+                    "message": exc.detail,
+                },
+            ) from exc
 
 
     @app.get("/api/v1/iocs/{indicator:path}")

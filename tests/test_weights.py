@@ -19,7 +19,7 @@ import pytest
 from app.lifecycle import explain_confidence, explain_verdict
 from app.models import IocStatus, RejectReason, Verdict
 from app.service import ThreatIocService
-from app.store import IocStore
+from app.store import IocStore, RejudgeFailed
 from app.weights import WeightConfigError, WeightRegistry
 
 NOW = "2026-09-23T00:00:00Z"
@@ -317,6 +317,280 @@ def test_rejudge_failure_is_atomic_and_retryable():
     print("[判定依据] 二次重试:", summary2)
     assert summary2["rejudged"] == 0
     assert {ind: len(ioc.history) for ind, ioc in store._iocs.items()} == history_len
+
+
+# ------------------------------------ 调权+重判事务：失败/重试/并发交叉
+
+def _full_snapshot(service):
+    """记录结论/置信度/版本/状态/审计链长度，用于失败前后逐字段比对。"""
+
+    snap = {}
+    for ind, ioc in service.store._iocs.items():
+        snap[ind] = (
+            ioc.verdict, ioc.confidence, ioc.status, ioc.weight_version,
+            ioc.expires_at, ioc.revoked, ioc.updated_at,
+            tuple((h.action, h.detail) for h in ioc.history),
+            tuple(sorted(ioc.sources)),
+        )
+    return snap
+
+
+def test_set_weights_failure_leaves_config_and_data_both_unchanged():
+    """调权触发的重判中途失败：权重配置与存量结论要么一起生效、要么都不变。
+
+    复现"新一版权重已对外生效、存量还按旧权重"的撕裂缺陷：修复后失败时
+    权重版本必须停在 v0，存量结论/版本标记也必须原样不动。
+    """
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 调权重判在提交前注入失败，检查配置与存量是否同时回滚")
+
+    before_data = _full_snapshot(service)
+    before_weights = (
+        service.weights.current().version,
+        [h["version"] for h in service.weight_history()],
+    )
+    print("[判定依据] 失败前 存量:", {k: v[:4] for k, v in before_data.items()})
+    print("[判定依据] 失败前 权重:", before_weights)
+
+    def _boom():
+        raise RuntimeError("模拟重算全部完成后提交前失败")
+
+    with pytest.raises(Exception) as exc:
+        service.set_weights({"alpha": 0.5}, note="撕裂复现", fail_hook=_boom)
+    print("[判定依据] 调用方收到异常:", type(exc.value).__name__, "|",
+          str(exc.value)[:60], "| cause:",
+          type(exc.value.__cause__).__name__)
+
+    after_data = _full_snapshot(service)
+    after_weights = (
+        service.weights.current().version,
+        [h["version"] for h in service.weight_history()],
+    )
+    print("[判定依据] 失败后 存量:", {k: v[:4] for k, v in after_data.items()})
+    print("[判定依据] 失败后 权重:", after_weights)
+    assert after_data == before_data          # 存量结论/版本/审计/来源零变更
+    assert after_weights == before_weights    # 权重版本与历史也零变更
+    assert after_weights[0] == 0
+    # 错误被明确反馈，而不是静默吞掉
+    from app.store import RejudgeFailed
+    assert isinstance(exc.value, RejudgeFailed)
+    assert isinstance(exc.value.__cause__, RuntimeError)
+
+
+def test_retry_same_weights_after_failure_records_single_version():
+    """失败后用同一份权重重试：版本/历史只推进一格，终态等同一次成功。"""
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 失败后用同一份权重再次调权")
+
+    def _fail_first():
+        raise RuntimeError("第一次失败")
+
+    with pytest.raises(RejudgeFailed):
+        service.set_weights({"alpha": 0.5}, note="第一次（失败）",
+                            fail_hook=_fail_first)
+
+    # 参照：从头开始、一次调权成功
+    reference = ThreatIocService()
+    _ingest_sample(reference)
+    reference.set_weights({"alpha": 0.5}, note="一次成功")
+
+    result = service.set_weights({"alpha": 0.5}, note="重试（成功）")
+    print("[判定依据] 重试响应:", result["version"], result["rejudge"])
+
+    versions = [h["version"] for h in service.weight_history()]
+    print("[判定依据] 权重版本序列:", versions)
+    assert versions == [0, 1]                 # 失败不占版本号，重试不重复记账
+    assert service.weights.current().version == 1
+
+    got = _snapshot(service)
+    want = _snapshot(reference)
+    print("[判定依据] 重试终态:", got)
+    print("[判定依据] 参照终态:", want)
+    assert got == want                        # 与一次成功完全一致
+    assert all(v[3] == 1 for v in got.values())  # 存量与新数据版本标记统一
+
+
+def test_failure_preserves_conclusions_provenance_and_hidden_lifecycle():
+    """失败不能改坏已有数据：结论/版本/来源追溯原样，过期与撤回不复活。"""
+
+    service = ThreatIocService()
+    service.submit_batch("p-b1", [
+        _good("192.0.2.30", "alpha", confidence=0.9, verdict="malicious"),
+        _good("192.0.2.30", "beta", confidence=0.5, verdict="benign"),
+        _good("192.0.2.31", "alpha", confidence=0.9,
+              expires_at="2026-09-22T00:00:00Z"),   # 已过期
+        _good("192.0.2.32", "alpha", confidence=0.9, revoked=True),  # 已撤回
+    ])
+    print("\n[场景] 含多来源/过期/撤回指标，调权重判失败")
+    before = _full_snapshot(service)
+    before_visible = {i.indicator for i in service.list_active(now=NOW)}
+    print("[判定依据] 失败前可见:", before_visible)
+
+    def _fail_provenance():
+        raise ValueError("重算失败")
+
+    with pytest.raises(RejudgeFailed):
+        service.set_weights({"alpha": 2.0}, note="应整体回滚",
+                            fail_hook=_fail_provenance)
+
+    after = _full_snapshot(service)
+    after_visible = {i.indicator for i in service.list_active(now=NOW)}
+    print("[判定依据] 失败后可见:", after_visible)
+    assert after == before                    # 结论/版本标记/来源追溯全保持
+    assert after_visible == before_visible    # 过期/撤回没有重新冒出来
+    assert "192.0.2.31" not in after_visible
+    assert "192.0.2.32" not in after_visible
+
+
+def test_failed_reweight_concurrent_with_ingestion_never_mixes_versions():
+    """失败调权的窗口内并发投递批次：不丢数据，且不出现新旧权重混用。
+
+    用 Barrier 让一个批次严格在"重算完成但尚未提交（随后失败）"的窗口里
+    尝试写入；由于调权+重判与批次共用同一把锁，该批次必然整体排在失败
+    事务之后（按旧权重 v0 入库），随后重试成功把全量统一推进到 v1。
+    """
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    print("\n[场景] 失败调权窗口内并发投递 4 个批次，随后重试成功")
+
+    entered = threading.Barrier(2)
+
+    def _hook():
+        # 此时重算已完成、提交尚未发生；释放批次线程后立即让事务失败，
+        # 于是被释放的批次只能在事务回滚释放锁之后按旧权重 v0 写入
+        entered.wait()
+        raise RuntimeError("提交前失败，触发整体回滚")
+
+    failure_seen: list[BaseException] = []
+
+    def do_failed_reweight():
+        try:
+            service.set_weights({"alpha": 0.5}, note="并发失败",
+                                fail_hook=_hook)
+        except RejudgeFailed as exc:
+            # 预期失败，由主线程随后重试；记录下来供断言不静默吞错
+            failure_seen.append(exc)
+
+    def do_ingest(n):
+        entered.wait() if n == 0 else None
+        service.submit_batch(f"xc-{n}", [
+            _good(f"203.0.113.{100 + n}", "gamma", confidence=0.6,
+                  verdict="suspicious"),
+        ])
+
+    threads = [threading.Thread(target=do_failed_reweight)]
+    threads += [threading.Thread(target=do_ingest, args=(n,))
+                for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 失败事务后：配置仍 v0；窗口期批次要么还没写、要么整体按 v0 写入
+    assert len(failure_seen) == 1               # 失败被明确反馈，未静默
+    assert service.weights.current().version == 0
+    mid_versions = {ioc.indicator: ioc.weight_version
+                    for ioc in service.store.all_iocs()}
+    print("[判定依据] 失败窗口期后版本分布:", set(mid_versions.values()))
+    assert set(mid_versions.values()) <= {0}  # 绝不能出现 v0/v1 混用
+
+    # 重试成功：全量统一 v1，无丢失（2 存量 + 4 新）
+    result = service.set_weights({"alpha": 0.5}, note="并发重试成功")
+    final = _snapshot(service)
+    version_dist = {v[3] for v in final.values()}
+    print(f"[判定依据] 重试后总量={service.store.count()} 版本分布={version_dist}")
+    assert service.store.count() == 6
+    assert all(v[3] == 1 for v in final.values())
+    assert result["rejudge"]["rejudged"] == 6
+
+    # 终态等价于"4 批次先按序入库、再一次调权成功"
+    reference = ThreatIocService()
+    _ingest_sample(reference)
+    for n in range(4):
+        reference.submit_batch(f"xc-{n}", [
+            _good(f"203.0.113.{100 + n}", "gamma", confidence=0.6,
+                  verdict="suspicious"),
+        ])
+    reference.set_weights({"alpha": 0.5}, note="参照一次成功")
+    assert final == _snapshot(reference)
+
+
+def test_failed_reweight_surfaces_structured_http_error():
+    """HTTP 层：重判失败返回结构化 500，且权重/存量未变更，可安全重试。"""
+
+    from fastapi.testclient import TestClient
+
+    import app.store as store_mod
+    from app.api import create_app
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+
+    def _boom(self, *a, **k):
+        raise RuntimeError("HTTP 路径模拟重判失败")
+
+    # monkeypatch 计划阶段，确保走真实 HTTP 错误映射
+    orig = store_mod.IocStore._plan_rejudge
+    store_mod.IocStore._plan_rejudge = _boom
+    try:
+        client = TestClient(create_app(feeds_dir="/nonexistent"))
+        client.app.state.service = service
+        resp = client.put("/api/v1/weights",
+                          json={"weights": {"alpha": 0.5}, "note": "http 失败"})
+    finally:
+        store_mod.IocStore._plan_rejudge = orig
+
+    print("\n[场景] HTTP 调权，重判阶段失败")
+    print("[判定依据] HTTP:", resp.status_code, resp.json())
+    assert resp.status_code == 500
+    body = resp.json()["detail"]
+    assert body["code"] == "weight_publish_rejudge_failed"
+    assert body["weight_version"] == 1
+    assert service.weights.current().version == 0
+
+    # 恢复后用同一份权重重试：200 且只记一版
+    resp2 = client.put("/api/v1/weights",
+                       json={"weights": {"alpha": 0.5}, "note": "http 重试"})
+    print("[判定依据] HTTP 重试:", resp2.status_code, resp2.json()["version"])
+    assert resp2.status_code == 200
+    assert resp2.json()["version"] == 1
+
+
+def test_manual_rejudge_failure_surfaces_structured_http_error():
+    """HTTP 层：手动 POST /rejudge 失败也返回结构化 500，且不静默吞错。"""
+
+    from fastapi.testclient import TestClient
+
+    import app.store as store_mod
+    from app.api import create_app
+
+    service = ThreatIocService()
+    _ingest_sample(service)
+    service.set_weights({"alpha": 0.5}, note="先发配置", rejudge=False)
+
+    def _boom(self, *a, **k):
+        raise ValueError("手动重判重算失败")
+
+    orig = store_mod.IocStore._plan_rejudge
+    store_mod.IocStore._plan_rejudge = _boom
+    try:
+        client = TestClient(create_app(feeds_dir="/nonexistent"))
+        client.app.state.service = service
+        resp = client.post("/api/v1/rejudge")
+    finally:
+        store_mod.IocStore._plan_rejudge = orig
+
+    print("\n[场景] HTTP 手动重判失败")
+    print("[判定依据] HTTP:", resp.status_code, resp.json())
+    assert resp.status_code == 500
+    assert resp.json()["detail"]["code"] == "rejudge_failed"
+    # 存量仍停在 v0（配置 v1 已发布但尚未重判，查询口径不变）
+    assert all(i.weight_version == 0 for i in service.store.all_iocs())
 
 
 # --------------------------------------------------- 过期/撤回不重判复活
